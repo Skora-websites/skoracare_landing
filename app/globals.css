@@ -1,0 +1,521 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: "Alte Haas Grotesk";
+  src: url("/fonts/AlteHaasGroteskRegular.woff") format("woff");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Alte Haas Grotesk";
+  src: url("/fonts/AlteHaasGroteskBold.woff") format("woff");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Redaction";
+  src: url("/fonts/Redaction-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Redaction";
+  src: url("/fonts/Redaction-Italic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Redaction";
+  src: url("/fonts/Redaction-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   SkoraCares design tokens (Tailwind v4)
+   SkoraCares Clinic OS — Mint, Deep Emerald & Clinical Slate (per DESIGN.md).
+   The brand/accent/navy scale names are kept from the previous theme so
+   every consuming file re-themes without edits:
+     brand-*  → deep emerald / forest   (#114232 · #0E382B anchors)
+     accent-* → mint (#1FD186) & sage   (chips, charts, completed tags)
+     navy-*   → deepest forest surfaces (sidebar #0D261E, tracker #0C2B21)
+   ───────────────────────────────────────────────────────────────────────── */
+@theme {
+  --font-sans: var(--font-alte-haas), "Alte Haas Grotesk", sans-serif;
+  --font-main: var(--font-alte-haas), "Alte Haas Grotesk", sans-serif;
+  --font-display: var(--font-alte-haas), "Alte Haas Grotesk", sans-serif;
+  --font-editorial: var(--font-alte-haas), "Alte Haas Grotesk", sans-serif;
+  --font-mono: var(--font-alte-haas), "Alte Haas Grotesk", monospace;
+  --font-secondary: var(--font-redaction), "Redaction", serif;
+  --font-redaction: var(--font-redaction), "Redaction", serif;
+  --font-serif: var(--font-redaction), "Redaction", serif;
+
+  /* Brand — deep emerald / forest */
+  --color-brand-50: #f1f5f3;
+  --color-brand-100: #dcebe4;
+  --color-brand-200: #c2d8cf;
+  --color-brand-300: #a2c5b5;
+  --color-brand-400: #6ba48c;
+  --color-brand-500: #3f7d5f;
+  --color-brand-600: #2a5f45;
+  --color-brand-700: #114232;
+  --color-brand-800: #0e382b;
+  --color-brand-900: #0b2d23;
+  --color-brand-950: #071e17;
+
+  /* Accent — mint & sage */
+  --color-accent-50: #ebfbf4;
+  --color-accent-100: #d2f4e6;
+  --color-accent-200: #a9eccd;
+  --color-accent-300: #7ce1b3;
+  --color-accent-400: #4dd69c;
+  --color-accent-500: #1fd186;
+  --color-accent-600: #14b571;
+  --color-accent-700: #109a60;
+  --color-accent-800: #0d7a4d;
+  --color-accent-900: #0b5f3d;
+  --color-accent-950: #073f28;
+
+  /* Dashboard chrome — deepest forest surfaces */
+  --color-navy-700: #1b4d3c;
+  --color-navy-800: #163d30;
+  --color-navy-900: #123227;
+  --color-navy-950: #0d261e;
+
+  /* Chart & badge helpers (DESIGN.md §2.1 sage / §5.3 hero chip) */
+  --color-forest-mid: #1f5441;
+  --color-mint-soft: #34d399;
+  --color-sage: #45b387;
+  --color-forest-deep: #0c2b21;
+
+  /* Dirty white & Cream palette — NO pure white anywhere */
+  --color-white: #FAF7F2;
+  --color-cream: #FAF7F2;
+  --color-cream-light: #FDFBF7;
+  --color-cream-dark: #F3EFE6;
+  --color-cream-muted: #EBE5D8;
+
+  /* Clinical slate neutrals with warm cream undertones (no sterile grey) */
+  --color-slate-50: #F7F4EE;
+  --color-slate-100: #EFECE4;
+  --color-slate-200: #E2DDD3;
+  --color-slate-300: #C9C3B7;
+  --color-slate-400: #9E988D;
+  --color-slate-500: #6D685E;
+  --color-slate-600: #545047;
+  --color-slate-700: #3C3933;
+  --color-slate-800: #2A2824;
+  --color-slate-900: #161513;
+  --color-slate-950: #0C0B0A;
+
+  /* Surfaces */
+  --color-surface: #F5F1E8;
+  --color-surface-subtle: #FAF7F2;
+  --color-ink: #161513;
+  --color-ink-muted: #6D685E;
+
+  --radius-4xl: 2rem;
+
+  --shadow-soft: 0 1px 3px rgba(20, 23, 22, 0.02), 0 6px 16px rgba(17, 66, 50, 0.06);
+  --shadow-float: 0 20px 60px rgba(17, 66, 50, 0.16);
+  --shadow-lift: 0 10px 24px -4px rgba(17, 66, 50, 0.08);
+  --shadow-pop: 0 4px 14px rgba(17, 66, 50, 0.15);
+
+  --animate-float: float 5s ease-in-out infinite;
+  --animate-float-slow: float 7s ease-in-out infinite;
+  --animate-pulse-dot: pulse-dot 2s ease-in-out infinite;
+
+  @keyframes float {
+    0%,
+    100% {
+      transform: translateY(0);
+    }
+    50% {
+      transform: translateY(-10px);
+    }
+  }
+  @keyframes pulse-dot {
+    0%,
+    100% {
+      opacity: 1;
+      transform: scale(1);
+    }
+    50% {
+      opacity: 0.55;
+      transform: scale(1.35);
+    }
+  }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Base
+   ───────────────────────────────────────────────────────────────────────── */
+:root {
+  --background: #FAF7F2;
+  --foreground: #161513;
+}
+
+body {
+  background: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-alte-haas), "Alte Haas Grotesk", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  /* Native-app feel: no page drag/overscroll bounce, no pull-to-refresh.
+     Scrolling happens inside the content container with momentum instead. */
+  overscroll-behavior: none;
+  -webkit-overflow-scrolling: touch;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html {
+  /* Kill the browser's rubber-band edge bounce on mobile. */
+  overscroll-behavior-y: none;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+.font-main,
+.font-display,
+.font-editorial,
+.font-sans,
+.font-mono {
+  font-family: var(--font-alte-haas), "Alte Haas Grotesk", sans-serif;
+}
+
+.font-secondary,
+.font-redaction,
+.font-serif {
+  font-family: var(--font-redaction), "Redaction", serif;
+}
+
+::selection {
+  background: #114232;
+  color: #fff;
+}
+
+/* Slim scrollbars for dashboard panels */
+.slim-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.slim-scroll::-webkit-scrollbar-thumb {
+  background: rgb(17 66 50 / 0.25);
+  border-radius: 999px;
+}
+.slim-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Reusable component classes
+   ───────────────────────────────────────────────────────────────────────── */
+@utility btn {
+  @apply inline-flex items-center justify-center gap-2 rounded-full font-medium transition-all duration-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-brand-700 disabled:pointer-events-none disabled:opacity-60;
+}
+
+@layer components {
+  /* Primary medical CTA — solid forest (#114232), pill radius */
+  .btn-primary {
+    @apply btn bg-brand-700 px-5 py-2.5 text-sm text-white shadow-md shadow-brand-700/20 hover:bg-brand-600 hover:shadow-lg hover:shadow-brand-700/30 active:scale-[0.98];
+  }
+  .btn-secondary {
+    @apply btn border border-brand-200 bg-white px-5 py-2.5 text-sm text-brand-800 hover:border-brand-600 hover:text-brand-700;
+  }
+  .btn-danger {
+    @apply btn bg-red-600 px-5 py-2.5 text-sm text-white hover:bg-red-700;
+  }
+  .btn-ghost {
+    @apply btn px-4 py-2 text-sm text-ink-muted hover:bg-brand-50 hover:text-brand-800;
+  }
+
+  /* Bento card — continuous 24px curvature, clinical hairline border,
+     CRM .bento elevation (0 1px 3px + 0 6px 16px at 2%) with hover lift */
+  .card {
+    @apply rounded-3xl border border-slate-200 bg-white;
+    box-shadow: 0 1px 3px rgb(0 0 0 / 0.02), 0 6px 16px rgb(0 0 0 / 0.02);
+  }
+  .card-hover {
+    @apply transition-all duration-300 hover:-translate-y-0.5 hover:shadow-lift;
+  }
+
+  .input {
+    @apply w-full rounded-xl border border-slate-300 bg-white px-3.5 py-2.5 text-sm text-ink outline-none transition-all placeholder:text-slate-400 focus:border-brand-600 focus:ring-4 focus:ring-brand-600/10;
+  }
+  .label {
+    @apply mb-1.5 block text-xs font-medium text-slate-600;
+  }
+
+  .badge {
+    @apply inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-semibold;
+  }
+
+  .table-shell {
+    @apply w-full max-w-full overflow-x-auto rounded-2xl border border-slate-200 bg-white;
+  }
+  .data-table {
+    @apply w-full text-left text-sm;
+  }
+  .data-table thead th {
+    @apply whitespace-nowrap border-b border-slate-200 bg-slate-50/80 px-3 py-2.5 text-xs font-medium text-slate-500 sm:px-4 sm:py-3;
+  }
+  .data-table tbody td {
+    @apply border-b border-slate-100 px-3 py-2.5 align-middle text-slate-700 sm:px-4 sm:py-3;
+  }
+  .data-table tbody tr:last-child td {
+    @apply border-b-0;
+  }
+  .data-table tbody tr {
+    @apply transition-colors hover:bg-brand-50/40;
+  }
+  /* Cells that must not wrap (keep the table compact): status, amounts,
+     dates, ids, actions. Text columns (description, name) wrap naturally
+     so wide rows stay readable on mobile instead of forcing a scroll. */
+  .data-table td.whitespace-nowrap,
+  .data-table .num {
+    @apply whitespace-nowrap;
+  }
+  .data-table td.text-right {
+    @apply whitespace-nowrap;
+  }
+}
+
+/* 45° diagonal hatch — open capacity / zero-traffic / pending fills */
+.hatch {
+  background-color: var(--color-slate-100);
+  background-image: repeating-linear-gradient(
+    45deg,
+    var(--color-slate-300),
+    var(--color-slate-300) 3px,
+    transparent 3px,
+    transparent 6px
+  );
+}
+
+/* ── Marketing landing page ───────────────────────────────────────────── */
+
+/* Main display face — Alte Haas Grotesk */
+.font-editorial {
+  font-family: var(--font-alte-haas), "Alte Haas Grotesk", sans-serif;
+}
+
+/* Infinite trust marquee — track holds the content twice and slides half
+   its width, producing a seamless loop. */
+@keyframes marquee-x {
+  from {
+    transform: translateX(0);
+  }
+  to {
+    transform: translateX(-50%);
+  }
+}
+.marquee-track {
+  display: flex;
+  width: max-content;
+  animation: marquee-x 36s linear infinite;
+}
+.marquee-track:hover {
+  animation-play-state: paused;
+}
+
+/* Film-grain overlay for dark cinematic sections */
+.ambient-grain {
+  position: relative;
+  isolation: isolate;
+}
+.ambient-grain::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0.4;
+  mix-blend-mode: overlay;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix type='saturate' values='0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)' opacity='0.35'/%3E%3C/svg%3E");
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .marquee-track {
+    animation: none;
+  }
+}
+
+/* ── Branded splash (components/pwa/splash-screen.tsx) ────────────────────
+   Shown once per session: canvas backdrop, pulsing ring echo around the
+   logo, cross bars staggered in. Keyframes live here (not Tailwind tokens)
+   because they're one-off animations. */
+.splash-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 1rem;
+  background: var(--color-brand-800);
+  animation: splash-fade-out 0.4s ease 1.3s forwards;
+}
+.splash-logo-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.splash-logo {
+  width: 96px;
+  height: 96px;
+  border-radius: 22px;
+  animation: splash-pop 0.7s cubic-bezier(0.2, 1.4, 0.4, 1) both;
+}
+.splash-ring {
+  position: absolute;
+  inset: -12px;
+  border-radius: 34px;
+  border: 2px solid var(--color-accent-500);
+  animation: splash-ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+.splash-ring-delay {
+  animation-delay: 0.5s;
+}
+.splash-title {
+  font-family: var(--font-sans);
+  font-size: 1.5rem;
+  font-weight: 800;
+  letter-spacing: -0.02em;
+  color: #ffffff;
+  animation: splash-rise 0.5s ease 0.2s both;
+}
+.splash-sub {
+  font-size: 0.75rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.2em;
+  color: var(--color-accent-500);
+  animation: splash-rise 0.5s ease 0.35s both;
+}
+@keyframes splash-ping {
+  0% { transform: scale(1); opacity: 0.7; }
+  80%, 100% { transform: scale(1.55); opacity: 0; }
+}
+@keyframes splash-pop {
+  0% { transform: scale(0.6); opacity: 0; }
+  100% { transform: scale(1); opacity: 1; }
+}
+@keyframes splash-rise {
+  0% { transform: translateY(10px); opacity: 0; }
+  100% { transform: translateY(0); opacity: 1; }
+}
+@keyframes splash-fade-out {
+  to { opacity: 0; visibility: hidden; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .splash-ring { animation: none; opacity: 0.4; }
+  .splash-logo, .splash-title, .splash-sub { animation-duration: 0.01s; animation-delay: 0s; }
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   Hyperrealistic Water Pond Buoyancy Physics
+   Gentle harmonic bobbing & drifting around small anchor radii
+   ───────────────────────────────────────────────────────────────────────── */
+@keyframes pond-float-1 {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg); }
+  25% { transform: translate3d(3.5px, -5px, 0) rotate(0.8deg); }
+  50% { transform: translate3d(-2px, -3px, 0) rotate(-0.5deg); }
+  75% { transform: translate3d(-3.5px, 3.5px, 0) rotate(-0.8deg); }
+}
+
+@keyframes pond-float-2 {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg); }
+  30% { transform: translate3d(-4.5px, 4.5px, 0) rotate(-1deg); }
+  55% { transform: translate3d(3px, -4px, 0) rotate(0.6deg); }
+  80% { transform: translate3d(3.5px, 2.5px, 0) rotate(0.9deg); }
+}
+
+@keyframes pond-float-3 {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg); }
+  20% { transform: translate3d(3px, 4px, 0) rotate(0.7deg); }
+  60% { transform: translate3d(-3.5px, -4.5px, 0) rotate(-0.8deg); }
+  85% { transform: translate3d(2px, -2px, 0) rotate(0.4deg); }
+}
+
+@keyframes pond-float-4 {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg); }
+  35% { transform: translate3d(-3px, -5.5px, 0) rotate(-0.8deg); }
+  70% { transform: translate3d(4.5px, 3px, 0) rotate(1deg); }
+}
+
+@keyframes pond-float-5 {
+  0%, 100% { transform: translate3d(0, 0, 0) rotate(0deg); }
+  28% { transform: translate3d(3.5px, 4.5px, 0) rotate(0.8deg); }
+  65% { transform: translate3d(-4.5px, -3.5px, 0) rotate(-0.9deg); }
+}
+
+.animate-pond-float-1 {
+  animation: pond-float-1 5.8s ease-in-out infinite;
+  will-change: transform;
+}
+
+.animate-pond-float-2 {
+  animation: pond-float-2 6.6s ease-in-out infinite;
+  will-change: transform;
+}
+
+.animate-pond-float-3 {
+  animation: pond-float-3 4.9s ease-in-out infinite;
+  will-change: transform;
+}
+
+.animate-pond-float-4 {
+  animation: pond-float-4 7.2s ease-in-out infinite;
+  will-change: transform;
+}
+
+.animate-pond-float-5 {
+  animation: pond-float-5 5.4s ease-in-out infinite;
+  will-change: transform;
+}
+
+/* Water contact shadow & surface tension meniscus */
+.water-item-shadow {
+  box-shadow:
+    0 18px 36px -8px rgba(2, 44, 34, 0.42),
+    0 6px 16px -4px rgba(4, 78, 63, 0.28),
+    0 0 0 1px rgba(255, 255, 255, 0.65);
+  transition: transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1), box-shadow 0.35s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.water-item-shadow:hover {
+  box-shadow:
+    0 28px 48px -10px rgba(2, 44, 34, 0.5),
+    0 10px 22px -4px rgba(4, 78, 63, 0.35),
+    0 0 0 2px rgba(255, 255, 255, 0.9);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-pond-float-1,
+  .animate-pond-float-2,
+  .animate-pond-float-3,
+  .animate-pond-float-4,
+  .animate-pond-float-5 {
+    animation: none;
+  }
+}
+
+html,
+body {
+  overflow-x: clip;
+}
+

@@ -1,0 +1,149 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { MAX_REPORT_BYTES, mbLabel } from "@/lib/config";
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { and, eq, inArray, isNull } from "drizzle-orm";
+import { db } from "@/lib/db";
+import { testBookings, users } from "@/lib/db/schema";
+import { sendMail } from "@/lib/mail/send";
+import { notifyUser } from "@/lib/notifications";
+import { audit } from "@/lib/security/audit-log";
+import { isVendorTokenExpired } from "./token-ttl";
+
+export type VendorUploadResult = { error: string | null; success?: boolean };
+
+const REPORT_DIR = path.join(process.cwd(), "storage", "uploads", "test-reports");
+
+/** Magic-byte check — only real PDF/JPEG/PNG files pass (spoofed extensions rejected). */
+function sniffFile(bytes: Buffer): "pdf" | "jpg" | "png" | null {
+  if (
+    (bytes.length >= 5 && bytes.subarray(0, 5).toString("latin1") === "%PDF-") ||
+    (bytes.length >= 6 &&
+      bytes[0] === 0xef &&
+      bytes[1] === 0xbb &&
+      bytes[2] === 0xbf &&
+      bytes.subarray(3, 8).toString("latin1") === "%PDF-")
+  ) {
+    return "pdf";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "jpg";
+  if (
+    bytes.length >= 8 &&
+    bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  ) {
+    return "png";
+  }
+  return null;
+}
+
+/**
+ * Vendor uploads a lab test report via a token link. The token grants access
+ * to exactly one booking — no authentication required (legacy parity), but the
+ * file is stored outside public/ and validated by magic bytes.
+ */
+export async function uploadTestReport(
+  token: string,
+  formData: FormData
+): Promise<VendorUploadResult> {
+  const [booking] = await db
+    .select({
+      id: testBookings.id,
+      doctorId: testBookings.doctorId,
+      patientId: testBookings.patientId,
+      status: testBookings.status,
+      uploadedFilePath: testBookings.uploadedFilePath,
+      uploadLinkToken: testBookings.uploadLinkToken,
+      updatedAt: testBookings.updatedAt,
+    })
+    .from(testBookings)
+    .where(eq(testBookings.uploadLinkToken, token));
+
+  if (!booking) return { error: "Invalid or expired upload link." };
+  if (booking.uploadLinkToken !== token) return { error: "Invalid or expired upload link." };
+
+  // Expiry (audit F-11): the token ages out with the booking window; the
+  // doctor re-arms it via "Regenerate upload link" (resets updatedAt).
+  if (isVendorTokenExpired(booking.updatedAt)) {
+    return { error: "Invalid or expired upload link." };
+  }
+
+  // Business rule: a cancelled booking must not be reactivated via upload,
+  // and a completed booking's clinical report must not be silently replaced.
+  if (booking.status === "cancelled") {
+    return { error: "This booking has been cancelled. Contact the clinic." };
+  }
+  if (booking.status === "completed" || booking.uploadedFilePath) {
+    return { error: "A report has already been uploaded for this booking. Contact the clinic if you need to upload again." };
+  }
+
+  const file = formData.get("test_report") as File | null;
+  if (!file || file.size === 0) return { error: "Please choose a report file." };
+  if (file.size > MAX_REPORT_BYTES) return { error: `Report must be under ${mbLabel(MAX_REPORT_BYTES)} MB.` };
+
+  const bytes = Buffer.from(await file.arrayBuffer());
+  const kind = sniffFile(bytes);
+  if (!kind) return { error: "Only PDF, JPG or PNG reports are allowed." };
+
+  const filename = `${crypto.randomUUID()}.${kind}`;
+  const relativePath = `test-reports/${filename}`;
+  await fs.mkdir(REPORT_DIR, { recursive: true });
+  await fs.writeFile(path.join(REPORT_DIR, filename), bytes);
+
+  // Conditional update: only a pending/in-progress booking with no report
+  // matches — two concurrent uploads can't both "win" and the second gets
+  // a clean error instead of silently replacing the first file.
+  const updated = await db
+    .update(testBookings)
+    .set({
+      uploadedFilePath: relativePath,
+      status: "completed",
+      updatedAt: new Date(),
+    })
+    .where(
+      and(
+        eq(testBookings.id, booking.id),
+        isNull(testBookings.uploadedFilePath),
+        inArray(testBookings.status, ["pending", "in-progress"])
+      )
+    );
+  if (updated[0].affectedRows !== 1) {
+    return { error: "A report has already been uploaded for this booking. Contact the clinic if you need to upload again." };
+  }
+
+  void audit.fileUploaded(booking.doctorId, {
+    bookingId: booking.id,
+    patientId: booking.patientId,
+    action: "vendor_report_uploaded",
+  });
+
+  // Notify the doctor that a lab report has been uploaded (fire-and-forget).
+  void (async () => {
+    try {
+      const [doctor] = await db
+        .select({ email: users.email, name: users.name })
+        .from(users)
+        .where(eq(users.id, booking.doctorId));
+      if (!doctor?.email) return;
+      await sendMail({
+        to: doctor.email,
+        subject: "Lab report uploaded — SkoraCares",
+        text: `Hi ${doctor.name},\n\nA vendor has uploaded a lab test report for booking #${booking.id}. You can view it from your Test Bookings dashboard.\n\n— SkoraCares`,
+      });
+      await notifyUser({
+        userId: booking.doctorId,
+        title: "Lab report uploaded",
+        message: `Report for booking #${booking.id} is ready to view.`,
+        type: "info",
+        link: "/doctor/test-bookings",
+      });
+    } catch {
+      // Email + notification failure must never block the upload response.
+    }
+  })();
+
+  revalidatePath("/doctor/test-bookings");
+  return { error: null, success: true };
+}

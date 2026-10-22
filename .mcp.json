@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "agentation": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "agentation-mcp", "server"]
+    },
+    "burp": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "mcp-remote", "http://127.0.0.1:9876"]
+    }
+  }
+}

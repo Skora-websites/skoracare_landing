@@ -1,0 +1,98 @@
+"use server";
+
+import { db } from "@/lib/db";
+import { leads } from "@/lib/db/schema";
+import { authRateLimit } from "@/lib/security/rate-limit";
+import { getClientIp } from "@/lib/security/ip";
+import { contactSchema } from "@/lib/validation";
+import { sendMail } from "@/lib/mail/send";
+import { auditLog } from "@/lib/security/audit-log";
+
+export type DemoBookingState = { success: boolean; error: string | null };
+
+export async function bookDemo(
+  _prev: DemoBookingState,
+  formData: FormData
+): Promise<DemoBookingState> {
+  // Anti-bot honeypot check: automated scrapers/spambots fill hidden inputs.
+  // Silently drop and pretend success so the bot abandons the target.
+  const honeypot = String(formData.get("company_website") ?? "").trim();
+  if (honeypot) {
+    return { success: true, error: null };
+  }
+
+  const name = String(formData.get("name") ?? "").trim();
+  const email = String(formData.get("email") ?? "").trim();
+  const phone = String(formData.get("phone") ?? "").trim();
+  const clinic = String(formData.get("clinic") ?? "").trim();
+  const message = String(formData.get("message") ?? "").trim();
+
+  const parsed = contactSchema.safeParse({
+    name,
+    email,
+    phone: phone || undefined,
+    clinic: clinic || undefined,
+    message,
+  });
+  if (!parsed.success) {
+    return { success: false, error: parsed.error.issues[0]?.message ?? "Invalid input." };
+  }
+
+  // Network IP rate limiting: blocks distributed/randomized email dictionary floods
+  const clientIp = await getClientIp();
+  const ipCheck = authRateLimit.demoIp(clientIp);
+  if (!ipCheck.allowed) {
+    const minutes = Math.ceil(ipCheck.retryAfterMs / 60_000);
+    return { success: false, error: `Too many requests from this network. Try again in ${minutes} minute(s).` };
+  }
+
+  const { allowed, retryAfterMs } = authRateLimit.demo(email);
+  if (!allowed) {
+    const minutes = Math.ceil(retryAfterMs / 60_000);
+    return { success: false, error: `Too many requests. Try again in ${minutes} minute(s).` };
+  }
+
+  const now = new Date();
+  try {
+    const [lead] = await db
+      .insert(leads)
+      .values({
+        name,
+        email,
+        phone: phone || null,
+        clinic: clinic || null,
+        message,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .$returningId();
+
+    void auditLog({
+      action: "demo_booked",
+      metadata: { leadId: Number(lead.id), email, name, clinic: clinic || null },
+    }).catch(() => undefined);
+
+    // Notify the sales inbox in the background — failures must never block
+    // the user's "thank you" confirmation. Without DEMO_NOTIFY_EMAIL
+    // configured the notify step is skipped (never sent to a placeholder).
+    const notifyTo = process.env.DEMO_NOTIFY_EMAIL;
+    void sendMail({
+      to: email,
+      subject: "Thank you for booking a demo — SkoraCare",
+      text: `Hi ${name},\n\nThanks for your interest in SkoraCare. Our team will reach out shortly to schedule your demo.\n\n— SkoraCare`,
+    }).then((sent) => {
+      if (notifyTo) {
+        void sendMail({
+          to: notifyTo,
+          subject: "New demo booking",
+          text: `New demo request:\n\nName: ${name}\nEmail: ${email}\nPhone: ${phone || "—"}\nClinic: ${clinic || "—"}\nMessage: ${message}`,
+        }).catch(() => undefined);
+      }
+      return sent;
+    }).catch(() => undefined);
+  } catch {
+    return { success: false, error: "Could not save your request. Please try again." };
+  }
+
+  return { success: true, error: null };
+}

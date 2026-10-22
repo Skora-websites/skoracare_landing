@@ -1,0 +1,463 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { and, eq, inArray } from "drizzle-orm";
+import { db } from "@/lib/db";
+import { appointments, billings, billingTypes, consultations, transactions } from "@/lib/db/schema";
+import {
+  requireWriteScope,
+  ensurePatientInScope,
+  ensureBillingTypeInScope,
+  ensureBillInScope,
+  type ActionScope,
+} from "@/lib/auth/action-scope";
+import { audit } from "@/lib/security/audit-log";
+import { billSchema } from "@/lib/validation";
+import { generateBillNumber, todayStr } from "@/lib/utils";
+
+type ActionResult = { error: string | null };
+
+const PAYMENT_METHODS = ["upi", "cash", "card", "netbanking", "credit"];
+
+/** Bills + linked income transactions always anchor to ONE doctor account. */
+function billAnchor(scope: ActionScope): number {
+  return scope.anchorDoctorId;
+}
+
+// ── Bill CRUD ──────────────────────────────────────────────────────────────
+
+export async function createBill(
+  _prev: ActionResult,
+  formData: FormData
+): Promise<ActionResult> {
+  const scope = await requireWriteScope("billing-create");
+  if (!scope) return { error: "You don't have permission to create bills." };
+  const doctorId = billAnchor(scope);
+  const now = new Date();
+  const patientId = Number(formData.get("patient_id"));
+  const billingTypeId = Number(formData.get("billing_type_id"));
+  const amount = String(formData.get("amount") ?? "0");
+  const paymentMethod = String(formData.get("payment_method") ?? "cash");
+  const notes = String(formData.get("notes") ?? "").trim() || null;
+  const appointmentId = formData.has("appointment_id")
+    ? Number(formData.get("appointment_id"))
+    : null;
+  const consultationId = formData.has("consultation_id")
+    ? Number(formData.get("consultation_id"))
+    : null;
+
+  const parsed = billSchema.safeParse({
+    patientId: String(formData.get("patient_id") ?? "0"),
+    billingTypeId: String(formData.get("billing_type_id") ?? "0"),
+    amount: String(formData.get("amount") ?? "0"),
+    description: String(formData.get("notes") ?? ""),
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Invalid input." };
+  }
+
+  if (!patientId || !billingTypeId) return { error: "Patient and billing type are required." };
+  if (!Number.isInteger(patientId) || !Number.isInteger(billingTypeId)) {
+    return { error: "Invalid patient or billing type." };
+  }
+  if (!PAYMENT_METHODS.includes(paymentMethod)) return { error: "Invalid payment method." };
+
+  if (!(await ensurePatientInScope(patientId, scope))) {
+    return { error: "Patient not found for this practice." };
+  }
+  if (!(await ensureBillingTypeInScope(billingTypeId, scope))) {
+    return { error: "Billing type not found." };
+  }
+  // Ownership: linked appointment/consultation must belong to THIS doctor —
+  // otherwise a forged form field could attach another doctor's records.
+  if (appointmentId != null) {
+    if (!Number.isInteger(appointmentId)) return { error: "Invalid appointment." };
+    const [appt] = await db
+      .select({ id: appointments.id })
+      .from(appointments)
+      .where(and(eq(appointments.id, appointmentId), eq(appointments.doctorId, doctorId)));
+    if (!appt) return { error: "Appointment not found for this doctor." };
+  }
+  if (consultationId != null) {
+    if (!Number.isInteger(consultationId)) return { error: "Invalid consultation." };
+    const [con] = await db
+      .select({ id: consultations.id })
+      .from(consultations)
+      .where(and(eq(consultations.id, consultationId), eq(consultations.doctorId, doctorId)));
+    if (!con) return { error: "Consultation not found for this doctor." };
+  }
+
+  // Credit payment: bill is created as PENDING (48h credit), income is only
+  // recognized once the doctor marks it collected (see collectCreditPayment).
+  const isCredit = paymentMethod === "credit";
+
+  // Bill + auto income transaction in ONE transaction — no orphan income
+  // if either write fails.
+  const { billNumber, billingId } = await db.transaction(async (tx) => {
+    const billNumber = generateBillNumber();
+    const [billResult] = await tx.insert(billings).values({
+      billNumber,
+      patientId,
+      doctorId,
+      billingTypeId,
+      appointmentId,
+      consultationId,
+      totalAmount: amount,
+      receivedAmount: isCredit ? "0" : amount,
+      pendingAmount: isCredit ? amount : "0",
+      paymentMethod: paymentMethod as never,
+      status: isCredit ? "pending" : "paid",
+      notes,
+      billDate: todayStr(now),
+      createdAt: now,
+      updatedAt: now,
+    });
+    const billingId = Number(billResult.insertId);
+
+    if (!isCredit) {
+      const [billingType] = await tx
+        .select({ name: billingTypes.name })
+        .from(billingTypes)
+        .where(eq(billingTypes.id, billingTypeId));
+
+      await tx.insert(transactions).values({
+        userId: doctorId,
+        type: 1,
+        billingId,
+        amount,
+        date: todayStr(now),
+        status: "approved",
+        description: `Bill ${billNumber}${billingType ? ` — ${billingType.name}` : ""}${notes ? ` (${notes})` : ""}`,
+        paymentMethod,
+        createdBy: "System",
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    return { billNumber, billingId };
+  });
+
+  void audit.billCreated(scope.callerId, { billingId, billNumber, patientId, billingTypeId, amount, paymentMethod: isCredit ? "credit" : paymentMethod });
+  if (!isCredit) void audit.transactionCreated(scope.callerId, { billingId, amount });
+
+  revalidatePath("/doctor/billing");
+  revalidatePath("/doctor/income-expense");
+  revalidatePath("/admin/billing");
+  return { error: null };
+}
+
+/** Mark a 48h-credit bill as collected — creates the income transaction. */
+export async function collectCreditPayment(billId: number): Promise<ActionResult> {
+  const scope = await requireWriteScope("billing-approve");
+  if (!scope) return { error: "You don't have permission to collect payments." };
+  if (!billId || !Number.isInteger(billId)) return { error: "Invalid bill ID." };
+
+  const [bill] = await db
+    .select({
+      id: billings.id,
+      doctorId: billings.doctorId,
+      totalAmount: billings.totalAmount,
+      status: billings.status,
+      paymentMethod: billings.paymentMethod,
+      billNumber: billings.billNumber,
+    })
+    .from(billings)
+    .where(eq(billings.id, billId));
+  if (!bill || !(await ensureBillInScope(billId, scope))) return { error: "Bill not found." };
+  if (bill.status === "paid") return { error: "This bill is already paid." };
+  if (bill.paymentMethod !== "credit") return { error: "Only credit bills can be collected this way." };
+
+  const now = new Date();
+  const amount = bill.totalAmount;
+
+  // ATOMIC CLAIM: conditional update — only one concurrent request flips
+  // pending→paid; losers see affectedRows 0 and get a friendly error instead
+  // of double-recognizing income.
+  const claimed = await db
+    .update(billings)
+    .set({ status: "paid", receivedAmount: amount, pendingAmount: "0", updatedAt: now })
+    .where(and(eq(billings.id, billId), eq(billings.status, "pending")));
+  if (claimed[0].affectedRows !== 1) {
+    return { error: "This bill was already collected." };
+  }
+
+  // Recognize the income under the bill's owning doctor so the ledger lands
+  // on the practice member who issued the bill.
+  await db.insert(transactions).values({
+    userId: bill.doctorId,
+    type: 1,
+    billingId: billId,
+    amount,
+    date: todayStr(now),
+    status: "approved",
+    description: `Bill ${bill.billNumber} — credit payment collected`,
+    paymentMethod: "credit",
+    createdBy: "System",
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  void audit.billCreated(scope.callerId, { billingId: billId, action: "credit_collected", amount, billNumber: bill.billNumber });
+  void audit.transactionCreated(scope.callerId, { billingId: billId, amount });
+
+  revalidatePath("/doctor/billing");
+  revalidatePath("/doctor/income-expense");
+  revalidatePath("/admin/billing");
+  return { error: null };
+}
+
+export async function updateBill(
+  _prev: ActionResult,
+  formData: FormData
+): Promise<ActionResult> {
+  const scope = await requireWriteScope("billing-edit");
+  if (!scope) return { error: "You don't have permission to edit bills." };
+  const now = new Date();
+  const billId = Number(formData.get("bill_id"));
+  const patientId = Number(formData.get("patient_id"));
+  const billingTypeId = Number(formData.get("billing_type_id"));
+  const totalAmount = String(formData.get("total_amount") ?? "0");
+  const receivedAmount = String(formData.get("received_amount") ?? "0");
+  const paymentMethod = String(formData.get("payment_method") ?? "cash");
+  const notes = String(formData.get("notes") ?? "").trim() || null;
+
+  if (!billId || !Number.isInteger(billId)) return { error: "Invalid bill ID." };
+  if (!patientId || !billingTypeId) return { error: "Patient and billing type are required." };
+  if (!PAYMENT_METHODS.includes(paymentMethod)) return { error: "Invalid payment method." };
+
+  if (!(await ensurePatientInScope(patientId, scope))) {
+    return { error: "Patient not found for this practice." };
+  }
+  if (!(await ensureBillingTypeInScope(billingTypeId, scope))) {
+    return { error: "Billing type not found." };
+  }
+
+  const totalNum = Number(totalAmount);
+  const receivedNum = Number(receivedAmount);
+  if (!Number.isFinite(totalNum) || totalNum <= 0) return { error: "Invalid total amount." };
+  if (!Number.isFinite(receivedNum) || receivedNum < 0) return { error: "Invalid received amount." };
+  // Overpay guard: received can never exceed total (audit found 9 negative-
+  // pending bills caused by exactly this missing check).
+  if (receivedNum > totalNum) {
+    return { error: "Received amount cannot exceed the total amount." };
+  }
+
+  const pendingAmount = Math.max(0, totalNum - receivedNum);
+  const status = pendingAmount <= 0 ? "paid" : receivedNum > 0 ? "partial" : "pending";
+
+  // Ownership-scoped update — capture the previous values for the audit trail
+  // so payment history is never silently overwritten (the bill's linked
+  // income transaction is rewritten below; the snapshot preserves what was
+  // there before).
+  const [existing] = await db
+    .select({
+      id: billings.id,
+      doctorId: billings.doctorId,
+      appointmentId: billings.appointmentId,
+      totalAmount: billings.totalAmount,
+      receivedAmount: billings.receivedAmount,
+      pendingAmount: billings.pendingAmount,
+      paymentMethod: billings.paymentMethod,
+      status: billings.status,
+    })
+    .from(billings)
+    .where(and(eq(billings.id, billId), inArray(billings.doctorId, scope.doctorIds)));
+  if (!existing) return { error: "Bill not found." };
+  const doctorId = existing.doctorId;
+
+  // Bill + linked income transaction in ONE transaction — no drift between
+  // the bill and income records if either write fails.
+  await db.transaction(async (tx) => {
+    await tx
+      .update(billings)
+      .set({
+        patientId,
+        billingTypeId,
+        totalAmount,
+        receivedAmount,
+        pendingAmount: String(pendingAmount),
+        paymentMethod: paymentMethod as never,
+        status: status as never,
+        notes,
+        updatedAt: now,
+      })
+      .where(eq(billings.id, billId));
+
+    // Sync income transaction (update or create)
+    const [linkedTx] = await tx
+      .select({ id: transactions.id })
+      .from(transactions)
+      .where(eq(transactions.billingId, billId));
+
+    if (linkedTx) {
+      await tx
+        .update(transactions)
+        .set({
+          amount: receivedAmount,
+          paymentMethod,
+          date: todayStr(now),
+          updatedAt: now,
+        })
+        .where(eq(transactions.id, linkedTx.id));
+    } else if (receivedNum > 0) {
+      await tx.insert(transactions).values({
+        userId: doctorId,
+        type: 1,
+        billingId: billId,
+        amount: receivedAmount,
+        date: todayStr(now),
+        status: "approved",
+        description: `Bill update — #${billId}`,
+        paymentMethod,
+        createdBy: "System",
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+  });
+
+  void audit.billCreated(scope.callerId, {
+    billId,
+    action: "updated",
+    patientId,
+    billingTypeId,
+    totalAmount,
+    receivedAmount,
+    // Snapshot of the previous state (before this edit) — preserves payment
+    // history when the linked income transaction is rewritten.
+    previous: {
+      totalAmount: existing.totalAmount,
+      receivedAmount: existing.receivedAmount,
+      pendingAmount: existing.pendingAmount,
+      paymentMethod: existing.paymentMethod,
+      status: existing.status,
+    },
+  });
+
+  revalidatePath("/doctor/billing");
+  revalidatePath("/doctor/income-expense");
+  revalidatePath("/admin/billing");
+  return { error: null };
+}
+
+export async function deleteBill(billId: number): Promise<ActionResult> {
+  const scope = await requireWriteScope("billing-delete");
+  if (!scope) return { error: "You don't have permission to delete bills." };
+  if (!billId || !Number.isInteger(billId)) return { error: "Invalid bill ID." };
+
+  const [existing] = await db
+    .select({ id: billings.id })
+    .from(billings)
+    .where(and(eq(billings.id, billId), inArray(billings.doctorId, scope.doctorIds)));
+  if (!existing) return { error: "Bill not found." };
+
+  // Soft-delete linked transaction(s) + bill atomically.
+  await db.transaction(async (tx) => {
+    await tx
+      .update(transactions)
+      .set({ deletedAt: new Date() })
+      .where(eq(transactions.billingId, billId));
+
+    await tx
+      .update(billings)
+      .set({ deletedAt: new Date() })
+      .where(eq(billings.id, billId));
+  });
+
+  void audit.billCreated(scope.callerId, { billId, action: "deleted" });
+
+  revalidatePath("/doctor/billing");
+  revalidatePath("/doctor/income-expense");
+  revalidatePath("/admin/billing");
+  return { error: null };
+}
+
+// ── Billing Types CRUD ─────────────────────────────────────────────────────
+
+export async function createBillingType(
+  _prev: ActionResult,
+  formData: FormData
+): Promise<ActionResult> {
+  const scope = await requireWriteScope("billing-create");
+  if (!scope) return { error: "You don't have permission to create billing types." };
+  const doctorId = scope.anchorDoctorId;
+  const name = String(formData.get("name") ?? "").trim();
+  const defaultAmount = String(formData.get("default_amount") ?? "0");
+
+  if (!name) return { error: "Billing type name is required." };
+  const amountNum = Number(defaultAmount);
+  if (!Number.isFinite(amountNum) || amountNum < 0) return { error: "Invalid default amount." };
+
+  // Duplicate active-name check (DB also enforces via unique index).
+  const [dup] = await db
+    .select({ id: billingTypes.id })
+    .from(billingTypes)
+    .where(and(eq(billingTypes.doctorId, doctorId), eq(billingTypes.name, name), eq(billingTypes.isActive, true)));
+  if (dup) return { error: "A billing type with this name already exists." };
+
+  await db.insert(billingTypes).values({
+    doctorId,
+    name,
+    defaultAmount: String(amountNum),
+    isActive: true,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+
+  revalidatePath("/doctor/billing");
+  revalidatePath("/admin/billing");
+  return { error: null };
+}
+
+export async function updateBillingType(
+  _prev: ActionResult,
+  formData: FormData
+): Promise<ActionResult> {
+  const scope = await requireWriteScope("billing-edit");
+  if (!scope) return { error: "You don't have permission to edit billing types." };
+  const id = Number(formData.get("id"));
+  const name = String(formData.get("name") ?? "").trim();
+  const defaultAmount = String(formData.get("default_amount") ?? "0");
+
+  if (!id || !Number.isInteger(id)) return { error: "Invalid billing type ID." };
+  if (!name) return { error: "Billing type name is required." };
+  const amountNum = Number(defaultAmount);
+  if (!Number.isFinite(amountNum) || amountNum < 0) return { error: "Invalid default amount." };
+
+  const [bt] = await db
+    .select({ id: billingTypes.id })
+    .from(billingTypes)
+    .where(and(eq(billingTypes.id, id), inArray(billingTypes.doctorId, scope.doctorIds)));
+  if (!bt) return { error: "Billing type not found." };
+
+  await db
+    .update(billingTypes)
+    .set({ name, defaultAmount: String(amountNum), updatedAt: new Date() })
+    .where(eq(billingTypes.id, id));
+
+  revalidatePath("/doctor/billing");
+  revalidatePath("/admin/billing");
+  return { error: null };
+}
+
+export async function deleteBillingType(id: number): Promise<ActionResult> {
+  const scope = await requireWriteScope("billing-delete");
+  if (!scope) return { error: "You don't have permission to delete billing types." };
+  if (!id || !Number.isInteger(id)) return { error: "Invalid billing type ID." };
+
+  const [bt] = await db
+    .select({ id: billingTypes.id })
+    .from(billingTypes)
+    .where(and(eq(billingTypes.id, id), inArray(billingTypes.doctorId, scope.doctorIds)));
+  if (!bt) return { error: "Billing type not found." };
+
+  // Soft-deactivate
+  await db
+    .update(billingTypes)
+    .set({ isActive: false, updatedAt: new Date() })
+    .where(eq(billingTypes.id, id));
+
+  revalidatePath("/doctor/billing");
+  revalidatePath("/admin/billing");
+  return { error: null };
+}

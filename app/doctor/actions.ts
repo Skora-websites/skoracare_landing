@@ -1,0 +1,467 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { z } from "zod";
+import { MAX_ATTACHMENT_BYTES, mbLabel } from "@/lib/config";
+import { redirect } from "next/navigation";
+import crypto from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
+import { and, eq, inArray } from "drizzle-orm";
+import { db } from "@/lib/db";
+import {
+  appointments,
+  transactions,
+  consultations,
+  consultationMedications,
+  supportTickets,
+  supportTicketMessages,
+  users,
+} from "@/lib/db/schema";
+import { getCurrentUser, hasPermission, homePathForRole } from "@/lib/auth/user";
+import { requireWriteScope, ensureIncomeTypeInScope, ensureExpenseTypeInScope } from "@/lib/auth/action-scope";
+import { requireDoctorPermission } from "@/lib/auth/server-permissions";
+import {
+  ensurePatientOfDoctor,
+  ensureAppointmentOfDoctor,
+  ensureTicketOwner,
+} from "@/lib/auth/ownership";
+import { audit } from "@/lib/security/audit-log";
+import { todayStr } from "@/lib/utils";
+import { supportTicketReplySchema } from "@/lib/validation";
+
+type ActionResult = { error: string | null };
+
+const BLOOD_GROUPS = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"];
+const APPOINTMENT_STATUSES = ["pending", "pending_consent", "confirmed", "completed", "cancelled"];
+const FOLLOW_UP_STATUSES = ["pending", "addressed", "no_follow_up", "rescheduled", "cancelled"] as const;
+
+function isFollowUpStatus(s: string): s is (typeof FOLLOW_UP_STATUSES)[number] {
+  return (FOLLOW_UP_STATUSES as readonly string[]).includes(s);
+}
+
+/** Legal transitions for follow-up statuses. */
+const FOLLOW_UP_TRANSITIONS: Record<string, string[]> = {
+  pending: ["addressed", "no_follow_up", "rescheduled", "cancelled"],
+  // Terminal states — once addressed / cancelled etc., no further transitions.
+  addressed: [],
+  no_follow_up: [],
+  rescheduled: ["pending"],
+  cancelled: [],
+};
+const PAYMENT_METHODS = ["upi", "cash", "card", "netbanking"];
+
+export async function updateAppointmentStatus(appointmentId: number, status: string) {
+  if (!APPOINTMENT_STATUSES.includes(status)) return;
+  const scope = await requireWriteScope("appointments-edit");
+  if (!scope) return;
+  // Business state machine: only the confirm transition (-> confirmed) is a
+  // generic status change. Complete/cancel have dedicated validated actions;
+  // reversal (completed/pending etc.) must not be possible via this action.
+  const [current] = await db
+    .select({ status: appointments.status })
+    .from(appointments)
+    .where(and(eq(appointments.id, appointmentId), inArray(appointments.doctorId, scope.doctorIds)));
+  if (!current) return;
+  if (status === "confirmed") {
+    // pending_consent must not be confirmed manually — that would bypass the
+    // outstanding patient consent. Only the consent response (or patient
+    // booking) confirms it.
+    if (current.status !== "pending") return;
+  } else {
+    // Any other status is not a valid generic transition — no-op.
+    return;
+  }
+  await db
+    .update(appointments)
+    .set({ status: status as never, updatedAt: new Date() })
+    .where(and(eq(appointments.id, appointmentId), inArray(appointments.doctorId, scope.doctorIds)));
+
+  revalidatePath("/doctor");
+  revalidatePath("/doctor/appointments");
+  revalidatePath("/admin/appointments");
+}
+
+// Billing lives in app/doctor/billing/actions.ts (the older duplicate here was
+// dead code — no UI imported it and it lacked credit-bill support).
+
+// ── Transactions ─────────────────────────────────────────────────────────
+
+const TX_FILE_DIR = path.join(process.cwd(), "storage", "uploads", "transactions");
+
+/** Magic-byte check — only real PDF/JPEG/PNG files pass (spoofed extensions rejected). */
+function sniffFile(bytes: Buffer): "pdf" | "jpg" | "png" | null {
+  if (
+    (bytes.length >= 5 && bytes.subarray(0, 5).toString("latin1") === "%PDF-") ||
+    (bytes.length >= 6 &&
+      bytes[0] === 0xef &&
+      bytes[1] === 0xbb &&
+      bytes[2] === 0xbf &&
+      bytes.subarray(3, 8).toString("latin1") === "%PDF-")
+  ) {
+    return "pdf";
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "jpg";
+  if (
+    bytes.length >= 8 &&
+    bytes.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+  ) {
+    return "png";
+  }
+  return null;
+}
+
+async function saveTransactionAttachment(file: File): Promise<string | null> {
+  if (!file || file.size === 0) return null;
+  if (file.size > MAX_ATTACHMENT_BYTES) throw new Error(`Attachment must be under ${mbLabel(MAX_ATTACHMENT_BYTES)} MB.`);
+  const bytes = Buffer.from(await file.arrayBuffer());
+  const kind = sniffFile(bytes);
+  if (!kind) throw new Error("Only PDF, JPG or PNG attachments are allowed.");
+  const filename = `${crypto.randomUUID()}.${kind}`;
+  await fs.mkdir(TX_FILE_DIR, { recursive: true });
+  await fs.writeFile(path.join(TX_FILE_DIR, filename), bytes);
+  return `transactions/${filename}`;
+}
+
+export async function createTransaction(
+  _prev: ActionResult,
+  formData: FormData
+): Promise<ActionResult> {
+  const scope = await requireWriteScope("income-expense-create");
+  if (!scope) return { error: "You don't have permission to add transactions." };
+  const doctorId = scope.anchorDoctorId;
+  const now = new Date();
+  const type = Number(formData.get("type"));
+  const amount = String(formData.get("amount") ?? "0");
+  const date = String(formData.get("date") ?? todayStr(now));
+  const incomeTypeRaw = String(formData.get("income_type_id") ?? "");
+  const expenseTypeRaw = String(formData.get("expense_type_id") ?? "");
+  const incomeTypeId = incomeTypeRaw ? Number(incomeTypeRaw) : null;
+  const expenseTypeId = expenseTypeRaw ? Number(expenseTypeRaw) : null;
+  const description = String(formData.get("description") ?? "").trim() || null;
+  const paymentMethod = String(formData.get("payment_method") ?? "").trim() || null;
+  const referenceNumber = String(formData.get("reference_number") ?? "").trim() || null;
+
+  if (![1, 2].includes(type)) return { error: "Invalid transaction type." };
+  const amountNum = Number(amount);
+  if (!Number.isFinite(amountNum) || amountNum <= 0) return { error: "Invalid amount." };
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { error: "Invalid date format." };
+  if (paymentMethod && !PAYMENT_METHODS.includes(paymentMethod)) {
+    return { error: "Invalid payment method." };
+  }
+
+  if (type === 1) {
+    if (!incomeTypeId || !Number.isInteger(incomeTypeId) || !(await ensureIncomeTypeInScope(incomeTypeId, scope))) {
+      return { error: "Income category is required." };
+    }
+  } else {
+    if (!expenseTypeId || !Number.isInteger(expenseTypeId) || !(await ensureExpenseTypeInScope(expenseTypeId, scope))) {
+      return { error: "Expense category is required." };
+    }
+  }
+
+  // Optional file attachment (stored outside public/ — PHI-safe)
+  const file = formData.get("file") as File | null;
+  let filePath: string | null = null;
+  if (file && file.size > 0) {
+    try {
+      filePath = await saveTransactionAttachment(file);
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : "Could not save the file." };
+    }
+  }
+
+  const [user] = await db.select({ name: users.name }).from(users).where(eq(users.id, doctorId));
+  await db.insert(transactions).values({
+    userId: doctorId,
+    type,
+    incomeTypeId: type === 1 ? incomeTypeId : null,
+    expenseTypeId: type === 2 ? expenseTypeId : null,
+    amount,
+    date: date as never,
+    status: "approved",
+    description,
+    paymentMethod,
+    referenceNumber,
+    filePath,
+    createdBy: user?.name ?? "System",
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  void audit.transactionCreated(scope.callerId, { type, amount, incomeTypeId, expenseTypeId, fileAttached: !!filePath });
+
+  revalidatePath("/doctor/income-expense");
+  revalidatePath("/admin/income-expense");
+  return { error: null };
+}
+
+// ── Consultation ─────────────────────────────────────────────────────────
+
+export async function saveConsultation(
+  _prev: { error: string | null; consultationId: number | null },
+  formData: FormData
+): Promise<{ error: string | null; consultationId: number | null }> {
+  const user = await getCurrentUser();
+  // Consultations are a doctor-facing module — the receptionist panel never
+  // records them, even though staff hold `appointments-complete` for the
+  // appointment status controls.
+  if (user?.role === "receptionist") {
+    return { error: "Only doctors can record consultations.", consultationId: null };
+  }
+  const doctorId = await requireDoctorPermission("appointments-complete");
+  if (!doctorId) {
+    return { error: "You don't have permission to record consultations.", consultationId: null };
+  }
+  const now = new Date();
+  const appointmentId = Number(formData.get("appointment_id"));
+  const patientId = Number(formData.get("patient_id"));
+  const symptomsNote = String(formData.get("symptoms_note") ?? "").trim() || null;
+  const examinationNote = String(formData.get("examination_note") ?? "").trim() || null;
+  const diagnosisNote = String(formData.get("diagnosis_note") ?? "").trim() || null;
+  const labNote = String(formData.get("lab_note") ?? "").trim() || null;
+  const medicationsNote = String(formData.get("medications_note") ?? "").trim() || null;
+  const medicalHistory = String(formData.get("medical_history") ?? "").trim() || null;
+  const followUpDate = String(formData.get("follow_up_date") ?? "").trim() || null;
+
+  // Vitals (persisted to the appointment — legacy ConsultationController@store parity)
+  const bloodGroup = String(formData.get("blood_group") ?? "").trim() || null;
+  const bp = String(formData.get("bp") ?? "").trim() || null;
+  const weightRaw = String(formData.get("weight") ?? "").trim();
+  const heightRaw = String(formData.get("height") ?? "").trim();
+
+  if (!patientId) return { error: "Patient is required.", consultationId: null };
+  if (!Number.isInteger(appointmentId) || !Number.isInteger(patientId)) {
+    return { error: "Invalid appointment or patient.", consultationId: null };
+  }
+  if (bloodGroup && !BLOOD_GROUPS.includes(bloodGroup))
+    return { error: "Invalid blood group.", consultationId: null };
+  if (bp && !/^\d{2,3}\/\d{2,3}$/.test(bp)) return { error: "BP must be like 120/80.", consultationId: null };
+  const weight = weightRaw ? Number(weightRaw) : null;
+  const height = heightRaw ? Number(heightRaw) : null;
+  if (weight !== null && (Number.isNaN(weight) || weight < 0 || weight > 500)) {
+    return { error: "Invalid weight.", consultationId: null };
+  }
+  if (height !== null && (Number.isNaN(height) || height < 0 || height > 300)) {
+    return { error: "Invalid height.", consultationId: null };
+  }
+
+  // Verify the appointment belongs to this doctor
+  if (!(await ensureAppointmentOfDoctor(appointmentId, doctorId))) {
+    return { error: "Appointment not found.", consultationId: null };
+  }
+
+  // Business state machine: a consultation may only be recorded for an
+  // appointment that is pending, confirmed, or already completed (edits).
+  // Cancelled appointments must not be re-opened, and a consultation must not
+  // bypass an outstanding patient consent.
+  const [apptStatus] = await db
+    .select({ status: appointments.status })
+    .from(appointments)
+    .where(and(eq(appointments.id, appointmentId), eq(appointments.doctorId, doctorId)));
+  if (apptStatus?.status === "cancelled") {
+    return { error: "Cancelled appointments cannot be consulted.", consultationId: null };
+  }
+  if (apptStatus?.status === "pending_consent") {
+    return { error: "Patient consent is required before starting this consultation.", consultationId: null };
+  }
+
+  // Verify the patient belongs to this doctor
+  if (patientId && !(await ensurePatientOfDoctor(doctorId, patientId))) {
+    return { error: "Patient not found for this doctor.", consultationId: null };
+  }
+
+  // Consultation upsert + medication rewrite + appointment vitals/status in
+  // ONE transaction — a mid-way failure previously left a consultation saved
+  // but the appointment un-completed (or meds deleted but not re-inserted).
+  const consultationId = await db.transaction(async (tx) => {
+    const [existing] = await tx
+      .select({ id: consultations.id })
+      .from(consultations)
+      .where(and(eq(consultations.appointmentId, appointmentId), eq(consultations.doctorId, doctorId)));
+
+    let consultationId: number;
+    if (existing) {
+      consultationId = existing.id;
+      const [current] = await tx
+        .select({ followUpStatus: consultations.followUpStatus })
+        .from(consultations)
+        .where(eq(consultations.id, existing.id));
+      await tx
+        .update(consultations)
+        .set({
+          symptomsNote,
+          examinationNote,
+          diagnosisNote,
+          labNote,
+          medicationsNote,
+          medicalHistory,
+          followUpDate,
+          followUpStatus: followUpDate ? "pending" : (current?.followUpStatus ?? "pending"),
+          updatedAt: now,
+        })
+        .where(and(eq(consultations.id, existing.id), eq(consultations.doctorId, doctorId)));
+    } else {
+      const [result] = await tx.insert(consultations).values({
+        patientId,
+        doctorId,
+        appointmentId,
+        consultationDate: now,
+        symptomsNote,
+        examinationNote,
+        diagnosisNote,
+        labNote,
+        medicationsNote,
+        medicalHistory,
+        followUpDate,
+        followUpStatus: "pending",
+        createdAt: now,
+        updatedAt: now,
+      });
+      consultationId = Number(result.insertId);
+    }
+
+    // Medications rows (comma separated medicine names, or per-line)
+    const medLines = String(formData.get("medications") ?? "")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (medLines.length > 0) {
+      await tx.delete(consultationMedications).where(eq(consultationMedications.consultationId, consultationId));
+      await tx.insert(consultationMedications).values(
+        medLines.map((line, i) => ({
+          consultationId,
+          medicineName: line,
+          order: i,
+          createdAt: now,
+          updatedAt: now,
+        }))
+      );
+    }
+
+    // Persist vitals + mark appointment completed
+    await tx
+      .update(appointments)
+      .set({
+        bloodGroup,
+        bp,
+        weight: weight !== null ? String(weight) : null,
+        height: height !== null ? String(height) : null,
+        status: "completed",
+        updatedAt: now,
+      })
+      .where(and(eq(appointments.id, appointmentId), eq(appointments.doctorId, doctorId)));
+
+    return consultationId;
+  });
+
+  revalidatePath("/doctor");
+  revalidatePath("/doctor/appointments");
+  return { error: null, consultationId };
+}
+
+type TicketAction = { error: string | null };
+
+export async function updateFollowUpStatus(consultationId: number, status: string) {
+  if (!isFollowUpStatus(status)) return;
+  const scope = await requireWriteScope("follow-up-status-update");
+  if (!scope) return;
+
+  // Fetch current status to validate transition.
+  const [current] = await db
+    .select({ followUpStatus: consultations.followUpStatus })
+    .from(consultations)
+    .where(and(eq(consultations.id, consultationId), inArray(consultations.doctorId, scope.doctorIds)))
+    .limit(1);
+  if (!current) return;
+  const from = current.followUpStatus ?? "pending";
+  const allowed = FOLLOW_UP_TRANSITIONS[from];
+  if (!allowed || !allowed.includes(status)) return;
+
+  await db
+    .update(consultations)
+    .set({ followUpStatus: status, updatedAt: new Date() })
+    .where(and(eq(consultations.id, consultationId), inArray(consultations.doctorId, scope.doctorIds)));
+
+  revalidatePath("/doctor/follow-ups");
+  revalidatePath("/admin/follow-ups");
+}
+
+// ── Support ──────────────────────────────────────────────────────────────
+// The subject of a new ticket — the shared reply schema validates a ticketId,
+// which a brand-new ticket does not have yet.
+const supportTicketSubjectSchema = z.object({ subject: z.string().trim().min(3).max(200) });
+
+export async function createSupportTicket(
+  _prev: TicketAction,
+  formData: FormData
+): Promise<TicketAction> {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  if (!["doctor", "receptionist"].includes(user.role)) {
+    redirect(homePathForRole(user.role));
+  }
+  const allowed = await hasPermission(user.id, "support-view");
+  if (!allowed) return { error: "You don't have permission to open support tickets." };
+  const subject = String(formData.get("subject") ?? "").trim();
+  const message = String(formData.get("message") ?? "").trim();
+
+  const parsed = supportTicketSubjectSchema.safeParse({ subject });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Invalid input." };
+  }
+
+  const now = new Date();
+  const [ticket] = await db.insert(supportTickets).values({
+    userId: user.id,
+    subject,
+    status: "open",
+    createdAt: now,
+    updatedAt: now,
+  });
+  await db.insert(supportTicketMessages).values({
+    supportTicketId: Number(ticket.insertId),
+    senderId: user.id,
+    message,
+    isAdminReply: false,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  void audit.supportTicketCreated(user.id, { subject });
+
+  revalidatePath("/doctor/support");
+  return { error: null };
+}
+
+export async function replySupportTicket(ticketId: number, formData: FormData) {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  const message = String(formData.get("message") ?? "").trim();
+
+  const parsed = supportTicketReplySchema.safeParse({
+    ticketId,
+    message,
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Invalid input." };
+  }
+
+  // Verify the ticket belongs to this user
+  if (!(await ensureTicketOwner(ticketId, user.id))) {
+    return { error: "Ticket not found." };
+  }
+
+  const now = new Date();
+  await db.insert(supportTicketMessages).values({
+    supportTicketId: ticketId,
+    senderId: user.id,
+    message,
+    isAdminReply: false,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  revalidatePath("/doctor/support");
+  return { error: null };
+}

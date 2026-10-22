@@ -1,0 +1,375 @@
+"use client";
+
+import { useCallback, useEffect, useRef, useState, useTransition } from "react";
+import { Loader2, MapPin, Phone, X } from "lucide-react";
+import { cancelSos, rateSosCase, triggerSos } from "@/lib/dispatch/actions";
+import { SosLiveMap } from "@/components/sos/sos-live-map";
+import { useWakeLock } from "@/components/sos/use-wake-lock";
+
+type StatusPayload = {
+  id: number;
+  status: string;
+  complaint: string | null;
+  createdAt: string | null;
+  patientLatitude: string;
+  patientLongitude: string;
+  doctor: {
+    name: string;
+    phone: string | null;
+    liveLatitude: string | null;
+    liveLongitude: string | null;
+    lastSeenAt: string | null;
+    caseStatus: string | null;
+  } | null;
+  // SOS parity fields. `patientOtp` is intentionally absent: only the doctor's
+  // panel ever holds the plaintext code.
+  etaMinutes: number | null;
+  distanceKm: string | null;
+  arrivedAt: string | null;
+  otpVerifiedAt: string | null;
+  rating: number | null;
+  billingId: number | null;
+  fare: number | null;
+};
+
+/**
+ * Uber-style SOS dispatch:
+ * - A single big pulsing red button — no form.
+ * - Pressing it auto-locates the patient and triggers the SOS.
+ * - After dispatch, shows a live map with the patient marker and the
+ *   doctor marker that moves in real time as the doctor drives over.
+ */
+export function SosDispatchButton({ initialRequestId = null }: { initialRequestId?: number | null }) {
+  const [locating, setLocating] = useState(false);
+  const [pending, startTransition] = useTransition();
+  const [requestId, setRequestId] = useState<number | null>(initialRequestId);
+  const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<StatusPayload | null>(null);
+  const [useGps, setUseGps] = useState(true);
+  const [cancelling, setCancelling] = useState(false);
+  const [rating, setRating] = useState(0);
+  const [ratingBusy, setRatingBusy] = useState(false);
+  const [ratingError, setRatingError] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Keep the screen awake while the tracker is live so the patient keeps
+  // seeing doctor movement (Android + iOS 16.4+; safe no-op elsewhere).
+  const trackingLive = requestId != null && status?.status === "accepted";
+  useWakeLock(Boolean(trackingLive));
+  // formRef reads CURRENT DOM input values at click time (no React state
+  // batching races between the toggle/fill and the SOS tap).
+  const formRef = useRef<HTMLFormElement>(null);
+  const gpsModeRef = useRef(true);
+
+  const getPosition = useCallback((): Promise<{ lat: number; lng: number }> => {
+    return new Promise((resolve, reject) => {
+      if (!navigator.geolocation) {
+        reject(new Error("Location not supported on this device."));
+        return;
+      }
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve({ lat: pos.coords.latitude, lng: pos.coords.longitude }),
+        () => reject(new Error("Could not get your location. Please enter coordinates.")),
+        { enableHighAccuracy: true, timeout: 10000 }
+      );
+    });
+  }, []);
+
+  const toggleMode = () => {
+    const next = !gpsModeRef.current;
+    gpsModeRef.current = next;
+    setUseGps(next);
+  };
+
+  const fireSos = () => {
+    setError(null);
+    startTransition(async () => {
+      try {
+        let lat: number;
+        let lng: number;
+        if (gpsModeRef.current) {
+          setLocating(true);
+          const pos = await getPosition();
+          lat = pos.lat;
+          lng = pos.lng;
+          setLocating(false);
+        } else {
+          // Read from the DOM directly via form data — no stale state races.
+          if (!formRef.current) { setError("Form not ready."); return; }
+          const fd = new FormData(formRef.current);
+          const rawLat = fd.get("latitude") as string;
+          const rawLng = fd.get("longitude") as string;
+          lat = Number(rawLat ?? "");
+          lng = Number(rawLng ?? "");
+          if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+            setError("Enter valid coordinates.");
+            return;
+          }
+        }
+        const fd = new FormData();
+        fd.set("latitude", String(lat));
+        fd.set("longitude", String(lng));
+        fd.set("radius_km", "10");
+        const res = await triggerSos({ error: null }, fd);
+        if (res.error) setError(res.error);
+        else if (res.requestId) setRequestId(res.requestId);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Could not determine your location.");
+        setLocating(false);
+      }
+    });
+  };
+
+  // Poll status while a request is active.
+  const pollOnce = useCallback(async () => {
+    if (!requestId) return;
+    try {
+      const r = await fetch(`/api/patient/sos/status/${requestId}`, { credentials: "include" });
+      if (r.ok) setStatus((await r.json()) as StatusPayload);
+    } catch {
+      /* retry on the next tick */
+    }
+  }, [requestId]);
+
+  useEffect(() => {
+    if (!requestId) return;
+    const tick = async () => {
+      try {
+        const r = await fetch(`/api/patient/sos/status/${requestId}`, { credentials: "include" });
+        if (r.ok) setStatus((await r.json()) as StatusPayload);
+      } catch {
+        /* retry on the next tick */
+      }
+    };
+    // Deferred so the first fetch doesn't setState synchronously during the
+    // effect (cascading-render lint rule) while still priming immediately.
+    const prime = setTimeout(tick, 0);
+    pollRef.current = setInterval(tick, 3000);
+    return () => {
+      clearTimeout(prime);
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, [requestId]);
+
+  // Request dispatched but the first status poll hasn't returned yet — show a
+  // neutral pending state instead of falling back to the idle SOS button
+  // (which would let the patient fire a second SOS while one is active).
+  if (requestId && !status) {
+    return (
+      <div className="rounded-3xl border-2 border-red-200 bg-white p-6 text-center shadow-lg">
+        <Loader2 className="mx-auto h-8 w-8 animate-spin text-slate-400" />
+        <p className="mt-2 font-semibold text-slate-700">Checking your SOS request…</p>
+        <p className="mt-1 text-sm text-slate-500">Hang tight — we are confirming the request status.</p>
+      </div>
+    );
+  }
+
+  // Live map view while waiting / accepted.
+  if (requestId && status) {
+    const pLat = Number(status.patientLatitude);
+    const pLng = Number(status.patientLongitude);
+    const dLat = status.doctor?.liveLatitude ? Number(status.doctor.liveLatitude) : null;
+    const dLng = status.doctor?.liveLongitude ? Number(status.doctor.liveLongitude) : null;
+
+    if (status.status === "pending") {
+      return (
+        <div className="overflow-hidden rounded-3xl border-2 border-red-200 bg-white shadow-lg">
+          <div className="space-y-3 p-5">
+            <div className="rounded-2xl bg-amber-50 p-4 text-center">
+              <Loader2 className="mx-auto h-8 w-8 animate-spin text-amber-600" />
+              <p className="mt-2 font-bold text-amber-800">Finding nearby doctors…</p>
+              <p className="text-xs text-amber-700">Alerting on-duty doctors near you.</p>
+            </div>
+            <SosLiveMap patientLat={pLat} patientLng={pLng} height={240} />
+            <button
+              onClick={async () => {
+                setCancelling(true);
+                await cancelSos(requestId);
+                setRequestId(null);
+                setStatus(null);
+                setCancelling(false);
+              }}
+              disabled={cancelling}
+              className="btn-secondary w-full justify-center py-2 text-xs"
+            >
+              <X className="h-4 w-4" /> {cancelling ? "Cancelling…" : "Cancel request"}
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    if (status.status === "accepted" && status.doctor) {
+      // Arrival + identity states drive the banner copy; the map and Call
+      // button stay identical to before in every step.
+      const arrived = status.arrivedAt != null;
+      const identityConfirmed = status.otpVerifiedAt != null;
+      return (
+        <div className="overflow-hidden rounded-3xl border-2 border-emerald-300 bg-white shadow-lg">
+          <div className="p-5">
+            <div className="flex items-center gap-3">
+              <span className="flex h-12 w-12 items-center justify-center rounded-full bg-emerald-100 text-2xl">🚑</span>
+              <div className="min-w-0 flex-1">
+                <p className="text-[17px] font-semibold tracking-[-0.01em] text-ink">
+                  {identityConfirmed
+                    ? "Visit in progress"
+                    : arrived
+                      ? `Dr. ${status.doctor.name} has arrived`
+                      : status.etaMinutes != null
+                        ? `Dr. ${status.doctor.name} is ${status.etaMinutes} min away`
+                        : `Dr. ${status.doctor.name} is on the way`}
+                </p>
+                <p className="text-xs text-slate-500">
+                  {identityConfirmed
+                    ? "The doctor has confirmed your identity."
+                    : arrived
+                      ? "Show the doctor your arrival code so they can confirm it's you."
+                      : dLat != null
+                        ? "En route — live tracking"
+                        : "Help has been dispatched"}
+                  {status.distanceKm ? ` · ${status.distanceKm} km` : ""}
+                </p>
+              </div>
+              {status.doctor.phone && (
+                <a href={`tel:${status.doctor.phone}`} className="inline-flex items-center gap-2 rounded-xl bg-emerald-700 px-4 py-2 text-sm font-bold text-white hover:bg-emerald-800">
+                  <Phone className="h-4 w-4" /> Call
+                </a>
+              )}
+            </div>
+            {arrived && !identityConfirmed && (
+              <p className="mt-3 rounded-xl bg-amber-50 px-4 py-2.5 text-xs font-medium text-amber-800">
+                Ask the doctor for their arrival code and read it out to them — that is how they
+                confirm they are with the right patient.
+              </p>
+            )}
+          </div>
+          <SosLiveMap patientLat={pLat} patientLng={pLng} doctorLat={dLat} doctorLng={dLng} height={300} />
+          <div className="p-4 text-center text-xs text-slate-500">
+            {dLat != null ? "Tracking your doctor live" : "Waiting for the doctor to start moving…"}
+          </div>
+        </div>
+      );
+    }
+
+    // Completed and not yet rated — the patient rates the visit.
+    if (status.status === "completed" && status.rating == null) {
+      return (
+        <div className="rounded-3xl border-2 border-emerald-300 bg-white p-6 text-center shadow-lg">
+          <p className="font-semibold text-ink">How was your emergency visit?</p>
+          <div className="mt-4 flex items-center justify-center gap-2">
+            {[1, 2, 3, 4, 5].map((n) => (
+              <button
+                key={n}
+                type="button"
+                aria-label={`Rate ${n} of 5`}
+                onClick={() => setRating(n)}
+                className={`text-3xl transition ${
+                  rating >= n ? "text-amber-500" : "text-slate-300"
+                } hover:text-amber-400`}
+              >
+                ★
+              </button>
+            ))}
+          </div>
+          {ratingError && <p className="mt-2 text-sm font-medium text-red-600">{ratingError}</p>}
+          <button
+            onClick={async () => {
+              if (rating === 0) {
+                setRatingError("Pick a rating from 1 to 5.");
+                return;
+              }
+              setRatingBusy(true);
+              setRatingError(null);
+              const res = await rateSosCase(requestId, rating, "");
+              if (res.error) setRatingError(res.error);
+              else await pollOnce();
+              setRatingBusy(false);
+            }}
+            disabled={ratingBusy}
+            className="btn-primary mt-4 justify-center"
+          >
+            {ratingBusy ? "Submitting…" : "Submit rating"}
+          </button>
+        </div>
+      );
+    }
+
+    return (
+      <div className="rounded-3xl border-2 border-red-200 bg-white p-6 text-center shadow-lg">
+        <p className="font-semibold text-slate-700">
+          {status.status === "expired" ? "No doctor was available nearby." : "This request is no longer active."}
+        </p>
+        <p className="mt-1 text-sm text-slate-500">Please call emergency services or try again.</p>
+        <button onClick={() => { setRequestId(null); setStatus(null); }} className="btn-primary mt-4 justify-center">
+          New SOS
+        </button>
+      </div>
+    );
+  }
+
+  // Idle state — the big Uber-style SOS button.
+  return (
+    <div className="overflow-hidden rounded-3xl border-2 border-red-200 bg-white shadow-lg">
+      <div className="bg-red-600 px-6 py-8 text-center">
+        <p className="text-sm font-semibold uppercase tracking-widest text-red-100">Emergency SOS</p>
+        <button
+          onClick={fireSos}
+          disabled={pending || locating}
+          className="group relative mx-auto mt-6 flex h-44 w-44 items-center justify-center"
+          aria-label="Send SOS"
+        >
+          {/* Pulsing rings */}
+          <span className="absolute inset-0 animate-ping rounded-full bg-red-400/40" />
+          <span className="absolute inset-3 animate-pulse rounded-full bg-red-500/40" />
+          <span className="relative flex h-32 w-32 items-center justify-center rounded-full border-4 border-red-300 bg-red-500 text-white shadow-2xl transition group-active:scale-95">
+            {pending || locating ? (
+              <Loader2 className="h-10 w-10 animate-spin" />
+            ) : (
+              <span className="text-center">
+                <span className="block font-display text-lg font-extrabold leading-tight">SOS</span>
+                <span className="block text-[10px] font-semibold uppercase tracking-wider text-red-200">Tap for help</span>
+              </span>
+            )}
+          </span>
+        </button>
+        <p className="mt-4 text-xs text-red-100">
+          {locating ? "Getting your location…" : pending ? "Sending your request…" : "Tap the button — we’ll find nearby doctors instantly."}
+        </p>
+      </div>
+
+      <div className="space-y-3 p-5">
+        {/* Location source */}
+        <div className="flex items-center justify-between">
+          <p className="text-xs font-semibold text-slate-500">YOUR LOCATION</p>
+          <button
+            type="button"
+            onClick={toggleMode}
+            className="text-xs font-semibold text-brand-700 hover:text-brand-600"
+          >
+            {useGps ? "Use manual coords" : "Use GPS"}
+          </button>
+        </div>
+        {useGps ? (
+          <button
+            type="button"
+            onClick={() => {
+              setError(null);
+              getPosition()
+                .then(() => setError("Location ready — tap SOS."))
+                .catch((e) => setError(e.message));
+            }}
+            className="btn-secondary w-full justify-center py-2 text-xs"
+          >
+            <MapPin className="h-4 w-4" /> Use my current location
+          </button>
+        ) : (
+          <form ref={formRef} className="grid grid-cols-2 gap-3">
+            <input name="latitude" placeholder="Latitude" className="input" inputMode="decimal" />
+            <input name="longitude" placeholder="Longitude" className="input" inputMode="decimal" />
+          </form>
+        )}
+        {error && <p className="text-xs text-red-600">{error}</p>}
+      </div>
+    </div>
+  );
+}

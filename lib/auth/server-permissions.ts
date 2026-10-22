@@ -1,0 +1,59 @@
+import "server-only";
+
+/**
+ * Server-only permission guard for the doctor dashboard.
+ *
+ * Kept in its own module (NOT in `lib/auth/permissions.ts`) so that the pure
+ * route→permission map stays import-safe for client components. Anything in
+ * this file may import `next/headers`-dependent helpers — it must never be
+ * imported from a `"use client"` component.
+ */
+
+import { redirect } from "next/navigation";
+import { getCurrentUser, hasPermission, homePathForRole, isTrialExpired } from "./user";
+import { resolvePracticeDoctorId } from "@/lib/queries/doctor";
+
+/**
+ * Default module permissions a brand-new doctor gets so the dashboard is
+ * usable out of the box — the clinical core (D3): dashboard (also covers the
+ * consultations entry, which is nav-mapped to the dashboard module),
+ * appointments, schedule (own slots), follow-ups and support. Finance,
+ * registrations, inventory and team-administration modules stay
+ * owner/staff-tier concerns; super-admin can widen a doctor via the
+ * permissions dialog.
+ */
+export const DEFAULT_DOCTOR_MODULE_PERMS = [
+  "dashboard",
+  "appointments",
+  "schedule",
+  "follow-up",
+  "support",
+] as const;
+
+/**
+ * Server-action guard: resolves the acting doctor id (redirecting to /login
+ * when unauthenticated or out of role, like the per-file `getDoctorId`
+ * helpers) and returns `null` when the user lacks the permission. Callers
+ * should short-circuit with a user-facing error on `null`:
+ *
+ *   const doctorId = await requireDoctorPermission("billing-create");
+ *   if (!doctorId) return { error: "You don't have permission to create bills." };
+ *
+ * Permission checks are React-cached per request (getUserPermissions), so
+ * this adds no extra DB round-trips beyond the one the nav already does.
+ */
+export async function requireDoctorPermission(
+  permission: string
+): Promise<number | null> {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  if (!["doctor", "receptionist"].includes(user.role)) {
+    redirect(homePathForRole(user.role));
+  }
+  // Trial expiry blocks doctor read/write paths too (audit F-03) — the
+  // layout gate alone is reachable only through page renders. Receptionists
+  // are unaffected: only the doctor role carries a trial.
+  if (isTrialExpired(user)) return null;
+  if (!(await hasPermission(user.id, permission))) return null;
+  return resolvePracticeDoctorId(user);
+}

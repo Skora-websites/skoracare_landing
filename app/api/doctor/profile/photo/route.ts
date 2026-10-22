@@ -1,0 +1,69 @@
+import fs from "node:fs/promises";
+import path from "node:path";
+import { eq } from "drizzle-orm";
+import { db } from "@/lib/db";
+import { users } from "@/lib/db/schema";
+import { requireApiPermission } from "@/lib/auth/guard";
+import { isPracticeDoctor } from "@/lib/queries/clinic";
+import { resolveWithinStorage } from "@/lib/utils/uploads";
+
+export const runtime = "nodejs";
+
+const CONTENT_TYPES: Record<string, string> = {
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".png": "image/png",
+};
+
+/**
+ * Serves the signed-in user's photo, or — with ?user_id= — a practice
+ * doctor's photo (member profile cards). Practice scoping prevents probing
+ * arbitrary users' photos.
+ */
+export async function GET(request: Request) {
+  // Matches /doctor/profile → "dashboard" module in DOCTOR_ROUTE_PERMISSIONS.
+  const viewer = await requireApiPermission(["doctor", "receptionist"], "dashboard");
+  if (viewer instanceof Response) return viewer;
+
+  const viewerDoctorId = viewer.role === "receptionist" ? (viewer.doctorId ?? viewer.id) : viewer.id;
+  const requestedId = Number(new URL(request.url).searchParams.get("user_id") ?? "");
+  const targetId = Number.isInteger(requestedId) && requestedId > 0 ? requestedId : viewer.id;
+
+  let photoPath: string | null;
+  if (targetId === viewer.id) {
+    photoPath = viewer.profilePhotoPath;
+  } else if (
+    (viewer.role === "doctor" || viewer.role === "receptionist") &&
+    (await isPracticeDoctor(viewerDoctorId, targetId))
+  ) {
+    const [row] = await db
+      .select({ profilePhotoPath: users.profilePhotoPath })
+      .from(users)
+      .where(eq(users.id, targetId));
+    photoPath = row?.profilePhotoPath ?? null;
+  } else {
+    return new Response("Forbidden", { status: 403 });
+  }
+
+  if (!photoPath) return new Response("Not found", { status: 404 });
+
+  const ext = path.extname(photoPath).toLowerCase();
+  const contentType = CONTENT_TYPES[ext];
+  if (!contentType) return new Response("Not found", { status: 404 });
+
+  // Path-traversal defense: resolve and verify the file stays inside storage/uploads.
+  const filePath = resolveWithinStorage(photoPath);
+  if (!filePath) return new Response("Forbidden", { status: 403 });
+
+  try {
+    const bytes = await fs.readFile(filePath);
+    return new Response(bytes, {
+      headers: {
+        "Content-Type": contentType,
+        "Cache-Control": "private, no-store",
+      },
+    });
+  } catch {
+    return new Response("Not found", { status: 404 });
+  }
+}

@@ -1,0 +1,919 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+import { saveConsentFile } from "@/lib/files/consent-upload";
+import crypto from "node:crypto";
+import { and, eq, inArray, ne, or } from "drizzle-orm";
+import { db } from "@/lib/db";
+import {
+  appointments,
+  appointmentConsultConsents,
+  clinicDoctors,
+  consultations,
+  billings,
+  doctorClinics,
+  doctorSchedules,
+  users,
+} from "@/lib/db/schema";
+import { requireWriteScope, ensureAppointmentInScope, ensurePatientInScope, isAdminTierRole, type ActionScope } from "@/lib/auth/action-scope";
+import { ensureClinicAccess, getClinicsOfDoctor, getReceptionistClinicIds } from "@/lib/queries/clinic";
+import { audit } from "@/lib/security/audit-log";
+import { notifyUser, wantsNotification } from "@/lib/notifications";
+import { sendMail } from "@/lib/mail/send";
+import { appointmentSchema } from "@/lib/validation";
+import { findDuplicateBooking, duplicateBookingError } from "@/lib/db/duplicate-booking";
+import { todayStr } from "@/lib/utils";
+
+// ── Shared helpers ────────────────────────────────────────────────────────
+
+export type AppointmentActionResult = { error: string | null };
+
+const CASE_TYPES = ["clinical_visit", "home_visit", "online_visit", "on_call_visit"] as const;
+const BLOOD_GROUPS = ["A+", "A-", "B+", "B-", "AB+", "AB-", "O+", "O-"];
+const CONSENT_TYPES = ["otp", "consent", "upload", "skipped", "email"];
+
+/** "h:mm AM/PM" or "HH:MM" -> minutes since midnight, or null. */
+function parseTimeToMinutes(t: string): number | null {
+  const m = t.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+  if (!m) return null;
+  let h = Number(m[1]);
+  const min = Number(m[2]);
+  const meridiem = m[3]?.toUpperCase();
+  if (meridiem) {
+    if (h < 1 || h > 12) return null;
+    if (meridiem === "PM" && h !== 12) h += 12;
+    if (meridiem === "AM" && h === 12) h = 0;
+  } else {
+    if (h > 23) return null;
+  }
+  if (min > 59) return null;
+  return h * 60 + min;
+}
+
+/** "HH:MM" (24h) -> "h:mm AM/PM" matching legacy storage format. */
+function toLegacyTime(time: string): string {
+  const m = time.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return time;
+  let h = Number(m[1]);
+  const min = m[2];
+  const meridiem = h >= 12 ? "PM" : "AM";
+  if (h === 0) h = 12;
+  else if (h > 12) h -= 12;
+  return `${h}:${min} ${meridiem}`;
+}
+
+function weekdayName(dateStr: string): string {
+  return new Date(`${dateStr}T00:00:00`)
+    .toLocaleDateString("en-US", { weekday: "long" })
+    .toLowerCase();
+}
+
+/** Active clinics the doctor practices at — owned or joined (member doctors). */
+async function getActiveClinics(doctorId: number, clinicId?: number | null) {
+  const conds = [
+    or(
+      eq(doctorClinics.doctorId, doctorId),
+      inArray(
+        doctorClinics.id,
+        db
+          .select({ id: clinicDoctors.clinicId })
+          .from(clinicDoctors)
+          .where(and(eq(clinicDoctors.doctorId, doctorId), eq(clinicDoctors.isActive, true)))
+      )
+    ),
+    eq(doctorClinics.isActive, true),
+  ];
+  if (clinicId && Number.isInteger(clinicId)) conds.push(eq(doctorClinics.id, clinicId));
+  return db.select().from(doctorClinics).where(and(...conds));
+}
+
+/** Active schedules for the doctor's clinics on a given weekday. */
+async function getSchedulesForDay(doctorId: number, date: string, clinicId?: number | null) {
+  const clinics = await getActiveClinics(doctorId, clinicId);
+  if (clinics.length === 0) return { clinics, schedules: [] as (typeof doctorSchedules.$inferSelect)[] };
+  const schedules = await db
+    .select()
+    .from(doctorSchedules)
+    .where(
+      and(
+        eq(doctorSchedules.doctorId, doctorId),
+        eq(doctorSchedules.dayOfWeek, weekdayName(date) as never),
+        eq(doctorSchedules.isActive, true),
+        inArray(
+          doctorSchedules.doctorClinicId,
+          clinics.map((c) => c.id)
+        )
+      )
+    );
+  return { clinics, schedules };
+}
+
+/**
+ * Resolve the doctor the appointment is FOR. Staff tiers (receptionist /
+ * admin / manager) may pass doctor_id to book for any doctor in their write
+ * scope; doctors always book for self.
+ * Returns null when the target doctor is outside the caller's scope.
+ */
+async function resolveTargetDoctor(
+  scope: ActionScope,
+  formData: FormData
+): Promise<number | null | "unauthorized"> {
+  const raw = String(formData.get("doctor_id") ?? "").trim();
+  if (!raw) return scope.anchorDoctorId;
+  const targetId = Number(raw);
+  if (!Number.isInteger(targetId) || targetId <= 0) return null;
+  // Doctors can only ever book for themselves — an injected doctor_id from a
+  // doctor-role user must not silently retarget the booking.
+  if (scope.strict) return targetId === scope.anchorDoctorId ? scope.anchorDoctorId : "unauthorized";
+  return scope.doctorIds.includes(targetId) ? targetId : "unauthorized";
+}
+
+/**
+ * Effective clinic for the appointment: chosen clinic if accessible, else —
+ * when booking on behalf of another practice doctor — a clinic SHARED by the
+ * caller's practice and the target doctor (so the booking lands at the clinic
+ * the receptionist's practice actually knows, not the target's unrelated own
+ * clinic), else the target's first active clinic.
+ */
+async function resolveClinic(effectiveDoctorId: number, clinicIdRaw: string, callerScope: ActionScope) {
+  const clinicId = Number(clinicIdRaw);
+  if (clinicId && Number.isInteger(clinicId) && (await ensureClinicAccess(clinicId, effectiveDoctorId))) {
+    // Receptionist tier: the clinic must also be one the receptionist is
+    // assigned to operate (role model G4) — a per-clinic front desk can't
+    // book at a clinic outside their assignment.
+    if (callerScope.callerRole === "receptionist") {
+      const assigned = await getReceptionistClinicIds(callerScope.callerId, { fallbackToPractice: true });
+      if (!assigned.includes(clinicId)) return null;
+    }
+    return clinicId;
+  }
+  const targetClinics = await getActiveClinics(effectiveDoctorId);
+  if (effectiveDoctorId !== callerScope.anchorDoctorId) {
+    // Prefer a clinic the CALLER's scope also knows (practice-shared), so
+    // front-desk/business bookings don't land on an unrelated own clinic.
+    const callerClinics = (
+      await Promise.all(callerScope.doctorIds.map((id) => getClinicsOfDoctor(id)))
+    ).flat();
+    const shared = targetClinics.find((c) => callerClinics.includes(c.id));
+    if (shared) return shared.id;
+  }
+  return targetClinics[0]?.id ?? null;
+}
+
+/** Does the time fall inside the schedule (handles overnight ranges)? */
+function timeInSchedule(timeMin: number, schedule: typeof doctorSchedules.$inferSelect): boolean {
+  if (schedule.is24Hours) return true;
+  const start = parseTimeToMinutes(schedule.startTime ?? "");
+  const end = parseTimeToMinutes(schedule.endTime ?? "");
+  if (start === null || end === null) return false;
+  let endAdj = end;
+  if (end < start) endAdj = end + 24 * 60;
+  let t = timeMin;
+  if (end < start && t < start) t += 24 * 60;
+  return t >= start && t <= endAdj;
+}
+
+/** Existing non-cancelled appointment at the same doctor/date/time (exclude optional id). */
+async function findTimeConflict(doctorId: number, date: string, time: string, excludeId?: number) {
+  const conds = [
+    eq(appointments.doctorId, doctorId),
+    eq(appointments.date, date as never),
+    eq(appointments.time, time),
+    ne(appointments.status, "cancelled"),
+  ];
+  if (excludeId && Number.isInteger(excludeId)) conds.push(ne(appointments.id, excludeId));
+  const [row] = await db.select({ id: appointments.id }).from(appointments).where(and(...conds)).limit(1);
+  return row ?? null;
+}
+
+/** Look up the consent slug generated for an appointment (post-commit link build). */
+async function slugFromAppointmentId(appointmentId: number): Promise<string> {
+  const [row] = await db
+    .select({ slug: appointmentConsultConsents.slug })
+    .from(appointmentConsultConsents)
+    .where(eq(appointmentConsultConsents.appointmentId, appointmentId));
+  return row?.slug ?? "";
+}
+
+// ── Create ────────────────────────────────────────────────────────────────
+
+export async function createAppointment(
+  _prev: AppointmentActionResult,
+  formData: FormData
+): Promise<AppointmentActionResult> {
+  const scope = await requireWriteScope("appointments-create");
+  if (!scope) return { error: "You don't have permission to book appointments." };
+  const now = new Date();
+
+  // Staff tiers may book for any in-scope doctor; doctors book for self.
+  const target = await resolveTargetDoctor(scope, formData);
+  if (target === "unauthorized") return { error: "Selected doctor is not part of this practice." };
+  if (target === null) return { error: "Invalid doctor." };
+  const effectiveDoctorId = target;
+
+  const patientIdRaw = String(formData.get("patient_id") ?? "").trim();
+  const patientString = String(formData.get("patient_string") ?? "").trim();
+  const date = String(formData.get("date") ?? "").trim();
+  const timeRaw = String(formData.get("time") ?? "").trim();
+  const caseType = String(formData.get("case_type") ?? "clinical_visit").trim();
+  const bloodGroup = String(formData.get("blood_group") ?? "").trim() || null;
+  const bp = String(formData.get("bp") ?? "").trim() || null;
+  const weightRaw = String(formData.get("weight") ?? "").trim();
+  const heightRaw = String(formData.get("height") ?? "").trim();
+  const remarks = String(formData.get("remarks") ?? "").trim() || null;
+  const consentType = String(formData.get("consent_type") ?? "").trim() || null;
+  const mobileNumber = String(formData.get("mobile_number") ?? "").trim() || null;
+
+  // Doctor-uploaded consent document (consent_type=upload). Validated early so
+  // the doctor fixes it before any DB work happens.
+  const consentFile = formData.get("consent_file");
+  let consentFilePath: string | null = null;
+  if (consentType === "upload") {
+    if (!(consentFile instanceof File) || consentFile.size === 0) {
+      return { error: "Upload the signed consent form first." };
+    }
+    try {
+      consentFilePath = await saveConsentFile(consentFile);
+    } catch (err) {
+      return { error: err instanceof Error ? err.message : "Invalid consent file." };
+    }
+  }
+
+  const parsed = appointmentSchema.safeParse({
+    patientId: patientIdRaw || undefined,
+    date,
+    time: timeRaw,
+    caseType,
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Invalid input." };
+  }
+
+  // ── Business validation (mirrors legacy store) ──
+  const today = todayStr(now);
+  if (date < today) return { error: "Appointment date must be today or later." };
+
+  const tMin = parseTimeToMinutes(timeRaw);
+  if (tMin === null) return { error: "Invalid time." };
+  if (date === today && tMin < now.getHours() * 60 + now.getMinutes()) {
+    return { error: "Appointment time must be in the future." };
+  }
+
+  if (!CASE_TYPES.includes(caseType as never)) return { error: "Invalid case type." };
+  if (bloodGroup && !BLOOD_GROUPS.includes(bloodGroup)) return { error: "Invalid blood group." };
+  if (consentType && !CONSENT_TYPES.includes(consentType)) return { error: "Invalid consent type." };
+  if (bp && !/^\d{2,3}\/\d{2,3}$/.test(bp)) return { error: "BP must be like 120/80." };
+
+  const weight = weightRaw ? Number(weightRaw) : null;
+  const height = heightRaw ? Number(heightRaw) : null;
+  if (weight !== null && (Number.isNaN(weight) || weight < 0 || weight > 500)) {
+    return { error: "Invalid weight." };
+  }
+  if (height !== null && (Number.isNaN(height) || height < 0 || height > 300)) {
+    return { error: "Invalid height." };
+  }
+  const digits = mobileNumber ? mobileNumber.replace(/[^0-9]/g, "") : "";
+  if (mobileNumber && (digits.length < 10 || digits.length > 15)) {
+    return { error: "Invalid mobile number." };
+  }
+
+  let patientId: number | null = null;
+  if (patientIdRaw) {
+    patientId = Number(patientIdRaw);
+    if (!Number.isInteger(patientId) || patientId <= 0) return { error: "Invalid patient." };
+    if (!(await ensurePatientInScope(patientId, scope))) {
+      return { error: "Patient not found for this practice." };
+    }
+  }
+  if (!patientId && !patientString) return { error: "Select a patient or add a walk-in name." };
+
+  // ── Time-slot conflict (same doctor, date, time; exclude cancelled) ──
+  const time = toLegacyTime(timeRaw);
+  const conflict = await findTimeConflict(effectiveDoctorId, date, time);
+  if (conflict) return { error: `Time slot ${time} is already booked.` };
+
+  // ── Duplicates finder: same patient already booked at this date + time ──
+  const duplicate = await findDuplicateBooking({ patientId, patientString, mobileNumber, date, time });
+  if (duplicate) return { error: duplicateBookingError(duplicate) };
+
+  // ── Schedule containment (mirrors legacy store) — per SELECTED doctor ──
+  const requestedClinicId = String(formData.get("clinic_id") ?? "").trim();
+  const clinicId = await resolveClinic(effectiveDoctorId, requestedClinicId, scope);
+  const { clinics, schedules } = await getSchedulesForDay(effectiveDoctorId, date, clinicId);
+  if (clinics.length > 0 && schedules.length > 0) {
+    const matching = schedules.find((s) => timeInSchedule(tMin, s));
+    if (!matching) {
+      return { error: "The selected time is outside the doctor's available schedule for this date." };
+    }
+  }
+
+  // ── Status derivation (mirrors legacy store) ──
+  let status: string = "pending";
+  if (consentType === "consent" || consentType === "email") status = "pending_consent";
+  else if (consentType === "otp" || consentType === "upload" || consentType === "skipped") status = "confirmed";
+
+  // Appointment + consent row in ONE transaction, with a doctor-row lock
+  // (SELECT ... FOR UPDATE) serializing concurrent bookings for the same
+  // doctor — closes the check-then-insert double-booking race.
+  let appointmentId: number | undefined;
+  try {
+    appointmentId = await db.transaction(async (tx) => {
+    await tx.select({ id: users.id }).from(users).where(eq(users.id, effectiveDoctorId)).for("update");
+    const conflict = await findTimeConflict(effectiveDoctorId, date, time);
+    if (conflict) throw new Error(`Time slot ${time} is already booked.`);
+    const dup = await findDuplicateBooking({ patientId, patientString, mobileNumber, date, time });
+    if (dup) throw new Error(duplicateBookingError(dup));
+
+    const [inserted] = await tx
+      .insert(appointments)
+      .values({
+        doctorId: effectiveDoctorId,
+        patientId,
+        patientString: patientString || null,
+        date: date as never,
+        time,
+        caseType: caseType as never,
+        bloodGroup,
+        bp,
+        weight: weight !== null ? String(weight) : null,
+        height: height !== null ? String(height) : null,
+        remarks,
+        consentType: (consentType as never) ?? null,
+        consentFile: consentFilePath,
+        mobileNumber,
+        status: status as never,
+        clinicId,
+        createdAt: now,
+        updatedAt: now,
+      })
+      .$returningId();
+    const appointmentId = inserted?.id;
+
+    // ── Consent link for consent/email types (mirrors legacy store) ──
+    // Legacy requires a registered patient + mobile for consent links.
+    if ((consentType === "consent" || consentType === "email") && appointmentId && patientId) {
+      const slug = crypto.randomUUID();
+      await tx.insert(appointmentConsultConsents).values({
+        appointmentId,
+        doctorId: effectiveDoctorId,
+        patientId,
+        slug,
+        isAccepted: false,
+        isRejected: false,
+        status: "pending_consent",
+        createdAt: now,
+        updatedAt: now,
+      });
+    }
+    return appointmentId;
+    });
+  } catch (err) {
+    // The in-transaction conflict check threw — surface as a form error.
+    if (err instanceof Error && (err.message.startsWith("Time slot") || err.message.startsWith("Duplicate booking"))) {
+      return { error: err.message };
+    }
+    throw err;
+  }
+
+  let consentLink: string | null = null;
+  if ((consentType === "consent" || consentType === "email") && appointmentId && patientId) {
+    const base = process.env.NEXT_PUBLIC_APP_URL ?? "http://localhost:3000"; // dev fallback — set NEXT_PUBLIC_APP_URL in prod
+    consentLink = `${base}/my-consent/${await slugFromAppointmentId(appointmentId)}`;
+  }
+
+  void audit.appointmentCreated(scope.callerId, {
+    appointmentId,
+    patientId: patientId ?? null,
+    patientString: patientString || null,
+    date,
+    time,
+    caseType,
+    status,
+    consentType: consentType ?? null,
+    consentFile: consentFilePath ? "uploaded" : null,
+    consentLink,
+  });
+
+  void notifyUser({
+    userId: effectiveDoctorId,
+    title: "New appointment booked",
+    message: `${patientString || `Patient #${patientId ?? "—"}`} — ${date} at ${time} (${caseType.replace(/_/g, " ")})`,
+    type: "success",
+    link: "/doctor/appointments",
+  });
+
+  // Confirm the appointment with the patient by email (fire-and-forget).
+  if (patientId) {
+    void (async () => {
+      try {
+        const [patient] = await db
+          .select({ name: users.name, email: users.email })
+          .from(users)
+          .where(eq(users.id, patientId));
+        if (!patient?.email) return;
+        if (!(await wantsNotification(patientId, "email", "appointment_booking"))) return;
+        await sendMail({
+          to: patient.email,
+          subject: "Appointment booked — SkoraCares",
+          text: `Hi ${patient.name},\n\nAn appointment has been booked for you:\nDate: ${date}\nTime: ${time}\nType: ${caseType.replace(/_/g, " ")}\n${consentLink ? `\nConsent link: ${consentLink}\n` : ""}\n— SkoraCares`,
+        });
+      } catch {
+        // Email failure must never block the booking.
+      }
+    })();
+  }
+
+  revalidatePath("/doctor");
+  revalidatePath("/doctor/appointments");
+  revalidatePath("/admin/appointments");
+
+  if (isAdminTierRole(scope.callerRole)) redirect(`/admin/appointments?created=${appointmentId ?? ""}`);
+  redirect(`/doctor/appointments?created=${appointmentId ?? ""}`);
+}
+
+// ── Update ────────────────────────────────────────────────────────────────
+
+export async function updateAppointment(
+  _prev: AppointmentActionResult,
+  formData: FormData
+): Promise<AppointmentActionResult> {
+  const scope = await requireWriteScope("appointments-edit");
+  if (!scope) return { error: "You don't have permission to edit appointments." };
+  const now = new Date();
+
+  const appointmentIdRaw = String(formData.get("appointment_id") ?? "").trim();
+  const patientIdRaw = String(formData.get("patient_id") ?? "").trim();
+  const patientString = String(formData.get("patient_string") ?? "").trim();
+  const date = String(formData.get("date") ?? "").trim();
+  const timeRaw = String(formData.get("time") ?? "").trim();
+  const caseType = String(formData.get("case_type") ?? "clinical_visit").trim();
+  const bloodGroup = String(formData.get("blood_group") ?? "").trim() || null;
+  const bp = String(formData.get("bp") ?? "").trim() || null;
+  const weightRaw = String(formData.get("weight") ?? "").trim();
+  const heightRaw = String(formData.get("height") ?? "").trim();
+  const remarks = String(formData.get("remarks") ?? "").trim() || null;
+  const mobileNumber = String(formData.get("mobile_number") ?? "").trim() || null;
+
+  const appointmentId = Number(appointmentIdRaw);
+  if (!Number.isInteger(appointmentId) || appointmentId <= 0) {
+    return { error: "Invalid appointment ID." };
+  }
+
+  // Scope-aware ownership: staff tiers may edit any in-scope doctor's
+  // appointment; doctors strictly their own.
+  if (!(await ensureAppointmentInScope(appointmentId, scope))) {
+    return { error: "Appointment not found." };
+  }
+
+  // Business rule: completed and cancelled appointments are immutable —
+  // their history must not be rewritten after the fact.
+  const [current] = await db
+    .select({ status: appointments.status })
+    .from(appointments)
+    .where(eq(appointments.id, appointmentId));
+  if (current?.status === "completed") {
+    return { error: "Completed appointments cannot be edited." };
+  }
+  if (current?.status === "cancelled") {
+    return { error: "Cancelled appointments cannot be edited." };
+  }
+
+  const parsed = appointmentSchema.safeParse({
+    patientId: patientIdRaw || undefined,
+    date,
+    time: timeRaw,
+    caseType,
+  });
+  if (!parsed.success) {
+    return { error: parsed.error.issues[0]?.message ?? "Invalid input." };
+  }
+
+  // ── Business validation ──
+  const today = todayStr(now);
+  if (date < today) return { error: "Appointment date must be today or later." };
+
+  const tMin = parseTimeToMinutes(timeRaw);
+  if (tMin === null) return { error: "Invalid time." };
+  if (date === today && tMin <= now.getHours() * 60 + now.getMinutes()) {
+    return { error: "Appointment time must be in the future." };
+  }
+
+  if (!CASE_TYPES.includes(caseType as never)) return { error: "Invalid case type." };
+  if (bloodGroup && !BLOOD_GROUPS.includes(bloodGroup)) return { error: "Invalid blood group." };
+  if (bp && !/^\d{2,3}\/\d{2,3}$/.test(bp)) return { error: "BP must be like 120/80." };
+
+  const weight = weightRaw ? Number(weightRaw) : null;
+  const height = heightRaw ? Number(heightRaw) : null;
+  if (weight !== null && (Number.isNaN(weight) || weight < 0 || weight > 500)) {
+    return { error: "Invalid weight." };
+  }
+  if (height !== null && (Number.isNaN(height) || height < 0 || height > 300)) {
+    return { error: "Invalid height." };
+  }
+  const digits = mobileNumber ? mobileNumber.replace(/[^0-9]/g, "") : "";
+  if (mobileNumber && (digits.length < 10 || digits.length > 15)) {
+    return { error: "Invalid mobile number." };
+  }
+
+  let patientId: number | null = null;
+  if (patientIdRaw) {
+    patientId = Number(patientIdRaw);
+    if (!Number.isInteger(patientId) || patientId <= 0) return { error: "Invalid patient." };
+    if (!(await ensurePatientInScope(patientId, scope))) {
+      return { error: "Patient not found for this practice." };
+    }
+  }
+  if (!patientId && !patientString) return { error: "Select a patient or add a walk-in name." };
+
+  // Staff tiers may reassign the appointment to another in-scope doctor.
+  // No doctor_id in the form = keep the appointment's current doctor (never
+  // silently reassign to the owner).
+  const hasDoctorField = formData.get("doctor_id") !== null;
+  let effectiveDoctorId: number;
+  if (hasDoctorField) {
+    const target = await resolveTargetDoctor(scope, formData);
+    if (target === "unauthorized") return { error: "Selected doctor is not part of this practice." };
+    if (target === null) return { error: "Invalid doctor." };
+    effectiveDoctorId = target;
+  } else {
+    const [current] = await db
+      .select({ doctorId: appointments.doctorId })
+      .from(appointments)
+      .where(eq(appointments.id, appointmentId));
+    if (!current) return { error: "Appointment not found." };
+    effectiveDoctorId = current.doctorId;
+  }
+
+  const time = toLegacyTime(timeRaw);
+  const conflict = await findTimeConflict(effectiveDoctorId, date, time, appointmentId);
+  if (conflict) return { error: `Time slot ${time} is already booked.` };
+
+  // ── Duplicates finder: same patient already booked at this date + time ──
+  const duplicate = await findDuplicateBooking({
+    patientId,
+    patientString,
+    mobileNumber,
+    date,
+    time,
+    excludeId: appointmentId,
+  });
+  if (duplicate) return { error: duplicateBookingError(duplicate) };
+
+  // ── Schedule containment — per (possibly reassigned) doctor ──
+  const requestedClinicId = String(formData.get("clinic_id") ?? "").trim();
+  const clinicId = await resolveClinic(effectiveDoctorId, requestedClinicId, scope);
+  const { clinics, schedules } = await getSchedulesForDay(effectiveDoctorId, date, clinicId);
+  if (clinics.length > 0 && schedules.length > 0) {
+    const matching = schedules.find((s) => timeInSchedule(tMin, s));
+    if (!matching) {
+      return { error: "The selected time is outside the doctor's available schedule for this date." };
+    }
+  }
+
+  await db
+    .update(appointments)
+    .set({
+      doctorId: effectiveDoctorId,
+      patientId,
+      patientString: patientString || null,
+      date: date as never,
+      time,
+      caseType: caseType as never,
+      bloodGroup,
+      bp,
+      weight: weight !== null ? String(weight) : null,
+      height: height !== null ? String(height) : null,
+      remarks,
+      mobileNumber,
+      clinicId,
+      // consent_type is immutable here by design (a sent consent link must
+      // not silently change meaning mid-flight) — status stays untouched
+      // because cancel/complete own it exclusively.
+      updatedAt: now,
+    })
+    .where(eq(appointments.id, appointmentId));
+
+  void audit.appointmentUpdated(scope.callerId, {
+    appointmentId,
+    patientId,
+    patientString: patientString || null,
+    date,
+    time,
+    caseType,
+  });
+
+  void notifyUser({
+    userId: effectiveDoctorId,
+    title: "Appointment updated",
+    message: `${patientString || `Patient #${patientId ?? "—"}`} — ${date} at ${time}`,
+    type: "info",
+    link: "/doctor/appointments",
+  });
+
+  revalidatePath("/doctor");
+  revalidatePath("/doctor/appointments");
+  revalidatePath("/admin/appointments");
+
+  if (isAdminTierRole(scope.callerRole)) redirect(`/admin/appointments?updated=true`);
+  redirect("/doctor/appointments?updated=true");
+}
+
+// ── Cancel ────────────────────────────────────────────────────────────────
+
+/** Scope-aware ownership for staff tiers; strict single-doctor for doctors. */
+async function ensureAppointmentAccessible(
+  appointmentId: number,
+  scope: ActionScope
+): Promise<boolean> {
+  return ensureAppointmentInScope(appointmentId, scope);
+}
+
+export async function cancelAppointment(appointmentId: number): Promise<AppointmentActionResult> {
+  const scope = await requireWriteScope("appointments-cancel");
+  if (!scope) return { error: "You don't have permission to cancel appointments." };
+  const now = new Date();
+
+  if (!Number.isInteger(appointmentId) || appointmentId <= 0) {
+    return { error: "Invalid appointment ID." };
+  }
+
+  if (!(await ensureAppointmentAccessible(appointmentId, scope))) {
+    return { error: "Appointment not found." };
+  }
+
+  // Fetch the appointment for validation
+  const [appt] = await db
+    .select({
+      id: appointments.id,
+      doctorId: appointments.doctorId,
+      date: appointments.date,
+      time: appointments.time,
+      status: appointments.status,
+      patientId: appointments.patientId,
+      patientString: appointments.patientString,
+      mobileNumber: appointments.mobileNumber,
+    })
+    .from(appointments)
+    .where(eq(appointments.id, appointmentId));
+
+  if (!appt) return { error: "Appointment not found." };
+
+  // Compare using parseTimeToMinutes instead of new Date(legacy time format)
+  const today = todayStr(now);
+  const apptMinutes = parseTimeToMinutes(appt.time);
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  if (appt.date < today || (appt.date === today && apptMinutes !== null && apptMinutes <= nowMinutes)) {
+    return { error: "Cannot cancel past appointments." };
+  }
+
+  if (appt.status === "cancelled") return { error: "Appointment is already cancelled." };
+  if (!["confirmed", "pending", "pending_consent"].includes(appt.status)) {
+    return { error: "Only confirmed and pending appointments can be cancelled." };
+  }
+
+  await db
+    .update(appointments)
+    .set({ status: "cancelled", updatedAt: now })
+    .where(eq(appointments.id, appointmentId));
+
+  // Sync any outstanding consent request to cancelled so the patient link
+  // stops accepting responses after the appointment is cancelled.
+  await db
+    .update(appointmentConsultConsents)
+    .set({ status: "cancelled", updatedAt: now })
+    .where(
+      and(
+        eq(appointmentConsultConsents.appointmentId, appointmentId),
+        eq(appointmentConsultConsents.status, "pending_consent")
+      )
+    );
+
+  void audit.appointmentCancelled(scope.callerId, {
+    appointmentId,
+    patientId: appt.patientId,
+    patientString: appt.patientString,
+    date: appt.date,
+    time: appt.time,
+  });
+
+  void notifyUser({
+    userId: appt.doctorId,
+    title: "Appointment cancelled",
+    message: `${appt.patientString || `Patient #${appt.patientId ?? "—"}`} — ${appt.date} at ${appt.time}`,
+    type: "warning",
+    link: "/doctor/appointments",
+  });
+
+  // Notify the patient their appointment was cancelled (in-app + email).
+  const cancelledPatientId = appt.patientId;
+  if (cancelledPatientId) {
+    void (async () => {
+      try {
+        const [patient] = await db
+          .select({ name: users.name, email: users.email })
+          .from(users)
+          .where(eq(users.id, cancelledPatientId));
+        if (patient) {
+          await notifyUser({
+            userId: cancelledPatientId,
+            title: "Appointment cancelled",
+            message: `Your appointment on ${appt.date} at ${appt.time} was cancelled.`,
+            type: "warning",
+            link: "/patient/appointments",
+          });
+          if (
+            patient.email &&
+            (await wantsNotification(cancelledPatientId, "email", "appointment_cancellation"))
+          ) {
+            await sendMail({
+              to: patient.email,
+              subject: "Appointment cancelled — SkoraCares",
+              text: `Hi ${patient.name},\n\nYour appointment on ${appt.date} at ${appt.time} has been cancelled by the clinic.\n\n— SkoraCares`,
+            });
+          }
+        }
+      } catch {
+        // Notification failure must never block cancellation.
+      }
+    })();
+  }
+
+  revalidatePath("/doctor");
+  revalidatePath("/doctor/appointments");
+  revalidatePath("/admin/appointments");
+
+  return { error: null };
+}
+
+// ── Complete ──────────────────────────────────────────────────────────────
+
+export async function completeAppointment(appointmentId: number): Promise<AppointmentActionResult> {
+  const scope = await requireWriteScope("appointments-complete");
+  if (!scope) return { error: "You don't have permission to complete appointments." };
+  const now = new Date();
+
+  if (!Number.isInteger(appointmentId) || appointmentId <= 0) {
+    return { error: "Invalid appointment ID." };
+  }
+
+  if (!(await ensureAppointmentAccessible(appointmentId, scope))) {
+    return { error: "Appointment not found." };
+  }
+
+  const [appt] = await db
+    .select({ id: appointments.id, status: appointments.status, patientId: appointments.patientId })
+    .from(appointments)
+    .where(eq(appointments.id, appointmentId));
+
+  if (!appt) return { error: "Appointment not found." };
+  if (appt.status === "completed") return { error: "Appointment is already completed." };
+  if (appt.status === "cancelled") return { error: "Cannot complete cancelled appointments." };
+  if (!["confirmed", "pending"].includes(appt.status)) {
+    return { error: "Only confirmed or pending appointments can be marked completed." };
+  }
+
+  await db
+    .update(appointments)
+    .set({ status: "completed", updatedAt: now })
+    .where(eq(appointments.id, appointmentId));
+
+  void audit.appointmentUpdated(scope.callerId, {
+    appointmentId,
+    status: "completed",
+  });
+
+  // Notify the patient their visit is complete (in-app + email), fire-and-forget.
+  const completedPatientId = appt.patientId;
+  if (completedPatientId) {
+    void (async () => {
+      try {
+        const [patient] = await db
+          .select({ name: users.name, email: users.email })
+          .from(users)
+          .where(eq(users.id, completedPatientId));
+        if (patient) {
+          await notifyUser({
+            userId: completedPatientId,
+            title: "Visit completed",
+            message: "Your appointment has been completed. Your records are available.",
+            type: "success",
+            link: "/patient/records",
+          });
+          if (
+            patient.email &&
+            (await wantsNotification(completedPatientId, "email", "appointment_booking"))
+          ) {
+            await sendMail({
+              to: patient.email,
+              subject: "Your visit is complete — SkoraCares",
+              text: `Hi ${patient.name},\n\nYour appointment has been marked complete. You can view your health records and prescriptions from your dashboard.\n\n— SkoraCares`,
+            });
+          }
+        }
+      } catch {
+        // Notification failure must never block completion.
+      }
+    })();
+  }
+
+  revalidatePath("/doctor");
+  revalidatePath("/doctor/appointments");
+  revalidatePath("/admin/appointments");
+
+  return { error: null };
+}
+
+// ── Delete ────────────────────────────────────────────────────────────────
+
+export async function deleteAppointment(appointmentId: number): Promise<AppointmentActionResult> {
+  const scope = await requireWriteScope("appointments-delete");
+  if (!scope) return { error: "You don't have permission to delete appointments." };
+  const now = new Date();
+
+  if (!Number.isInteger(appointmentId) || appointmentId <= 0) {
+    return { error: "Invalid appointment ID." };
+  }
+
+  if (!(await ensureAppointmentAccessible(appointmentId, scope))) {
+    return { error: "Appointment not found." };
+  }
+
+  const [appt] = await db
+    .select({
+      id: appointments.id,
+      date: appointments.date,
+      time: appointments.time,
+      status: appointments.status,
+    })
+    .from(appointments)
+    .where(eq(appointments.id, appointmentId));
+
+  if (!appt) return { error: "Appointment not found." };
+
+  const today = todayStr(now);
+  const apptMinutes = parseTimeToMinutes(appt.time);
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  const isFuture =
+    appt.date > today || (appt.date === today && apptMinutes !== null && apptMinutes > nowMinutes);
+  // Deletable states: cancelled (dead record, any date), pending/pending_consent
+  // (never happened yet), or completed past visits. Confirmed future visits must
+  // be cancelled first so the patient is notified before the record disappears.
+  const canDelete =
+    appt.status === "cancelled" ||
+    (isFuture
+      ? ["pending", "pending_consent", "completed"].includes(appt.status)
+      : ["completed"].includes(appt.status));
+
+  if (!canDelete) {
+    if (isFuture && appt.status === "confirmed") {
+      return { error: "Confirmed appointments cannot be deleted directly. Please cancel first." };
+    }
+    if (isFuture) {
+      return { error: "This appointment cannot be deleted." };
+    }
+    return { error: "Past appointments must be completed or cancelled before deletion." };
+  }
+
+  // Business rule / data integrity: appointments that generated clinical or
+  // financial records must be retained. Deleting them would orphan
+  // consultations and bills.
+  const [linkedConsultation] = await db
+    .select({ id: consultations.id })
+    .from(consultations)
+    .where(eq(consultations.appointmentId, appointmentId))
+    .limit(1);
+  if (linkedConsultation) {
+    return { error: "This appointment has a linked consultation. Delete the consultation first or keep the record." };
+  }
+  const [linkedBill] = await db
+    .select({ id: billings.id })
+    .from(billings)
+    .where(eq(billings.appointmentId, appointmentId))
+    .limit(1);
+  if (linkedBill) {
+    return { error: "This appointment has a linked bill. Delete the bill first or keep the record." };
+  }
+
+  // Delete consent records first
+  await db
+    .delete(appointmentConsultConsents)
+    .where(eq(appointmentConsultConsents.appointmentId, appointmentId));
+
+  // Hard delete the appointment
+  await db.delete(appointments).where(eq(appointments.id, appointmentId));
+
+  void audit.appointmentUpdated(scope.callerId, {
+    appointmentId,
+    action: "deleted",
+    date: appt.date,
+    time: appt.time,
+    status: appt.status,
+  });
+
+  revalidatePath("/doctor");
+  revalidatePath("/doctor/appointments");
+  revalidatePath("/admin/appointments");
+
+  return { error: null };
+}

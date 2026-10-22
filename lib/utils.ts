@@ -1,0 +1,165 @@
+import { clsx, type ClassValue } from "clsx";
+import { twMerge } from "tailwind-merge";
+
+export function cn(...inputs: ClassValue[]) {
+  return twMerge(clsx(inputs));
+}
+
+/** Duty-mode feature: derive the doctor's "I'm on duty" mode from the two duty flags. */
+export type DutyMode = "off" | "clinic" | "home" | "both";
+
+export function dutyModeOf(clinic: boolean | null | undefined, home: boolean | null | undefined): DutyMode {
+  if (clinic && home) return "both";
+  if (clinic) return "clinic";
+  if (home) return "home";
+  return "off";
+}
+
+/**
+ * Generate a globally-unique invoice number. The legacy scheme
+ * (`INV-` + last 6 digits of the ms timestamp) repeats every ~16.7 minutes,
+ * which collides on the `billings.bill_number` unique index (and across
+ * doctors, since the index is global). The full timestamp + random suffix
+ * makes collisions practically impossible while keeping an invoice-like
+ * format. On retry (rare), the caller simply generates a fresh number.
+ */
+export function generateBillNumber(): string {
+  return `INV-${Date.now()}-${Math.floor(100 + Math.random() * 900)}`;
+}
+
+/**
+ * Local server date as YYYY-MM-DD.
+ *
+ * The app is used by Indian clinics (server runs IST, UTC+05:30). Using
+ * `toISOString().slice(0,10)` (UTC) makes "today" wrong for 5.5 hours every
+ * day (00:00–05:30 IST): bookings, KPI "today" counts, bill dates and
+ * patient-facing records would be dated yesterday. This helper is the single
+ * source of truth for server-side date-of-day.
+ */
+/** Time-of-day greeting for dashboard headers (Good morning/afternoon/evening). */
+export function timeGreeting(d: Date = new Date()): string {
+  const h = d.getHours();
+  if (h < 12) return "Good morning";
+  if (h < 17) return "Good afternoon";
+  return "Good evening";
+}
+
+/** First token of a full name, honoring salutations like "Dr." / "Mr.". */
+export function firstName(fullName: string | null | undefined): string {
+  const tokens = (fullName ?? "").trim().split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return "Doctor";
+  // Skip a leading salutation ("Dr. Arjun" → "Arjun", "Dr Arjun" → "Arjun").
+  if (tokens.length > 1 && /^(dr|mr|mrs|ms|prof)\.?$/i.test(tokens[0])) return tokens[1];
+  return tokens[0];
+}
+
+export function todayStr(d: Date = new Date()): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
+/** Format a number as Indian Rupees. */
+export function formatINR(value: number | string | null | undefined) {
+  const n = Number(value ?? 0);
+  return new Intl.NumberFormat("en-IN", {
+    style: "currency",
+    currency: "INR",
+    maximumFractionDigits: 2,
+  }).format(n);
+}
+
+export function formatDate(d: Date | string | null | undefined) {
+  if (!d) return "—";
+  const date = typeof d === "string" ? new Date(d) : d;
+  return date.toLocaleDateString("en-IN", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+  });
+}
+
+export function formatDateTime(d: Date | string | null | undefined) {
+  if (!d) return "—";
+  const date = typeof d === "string" ? new Date(d) : d;
+  return date.toLocaleString("en-IN", {
+    day: "numeric",
+    month: "short",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+export function timeAgo(d: Date | string | null | undefined) {
+  if (!d) return "";
+  const date = typeof d === "string" ? new Date(d) : d;
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  const intervals: [number, string][] = [
+    [31536000, "year"],
+    [2592000, "month"],
+    [604800, "week"],
+    [86400, "day"],
+    [3600, "hour"],
+    [60, "minute"],
+  ];
+  for (const [secs, label] of intervals) {
+    const count = Math.floor(seconds / secs);
+    if (count >= 1) return `${count} ${label}${count > 1 ? "s" : ""} ago`;
+  }
+  return "just now";
+}
+
+export function initials(name: string) {
+  return name
+    .split(" ")
+    .map((p) => p[0])
+    .filter(Boolean)
+    .slice(0, 2)
+    .join("")
+    .toUpperCase();
+}
+
+/**
+ * Normalized wa.me link for a stored patient phone number, or null when the
+ * number is unusable. Strips everything but digits, drops a leading "0"
+ * trunk prefix, and defaults the country code to India (91) when the number
+ * carries none — matching the legacy WhatsApp quick-action behaviour.
+ */
+export function waMeLink(phone: string | null | undefined): string | null {
+  const digits = (phone ?? "").replace(/\D/g, "");
+  if (digits.length < 10) return null;
+  // Drop a trunk prefix before prefixing the country code — a stored
+  // "09812345670" and a bare "9812345670" are the same Indian mobile.
+  const stripped = digits.replace(/^0+/, "");
+  if (stripped.length < 10) return null;
+  const withCountry = stripped.length === 10 ? `91${stripped}` : stripped;
+  if (withCountry.length < 11 || withCountry.length > 15) return null;
+  return `https://wa.me/${withCountry}`;
+}
+
+export function slugify(input: string) {
+  return input
+    .toLowerCase()
+    .trim()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-");
+}
+
+/**
+ * Neutralize spreadsheet formula injection for CSV/XLSX export cells.
+ *
+ * Cells whose first character is =, +, - or @ may be evaluated as formulas
+ * by desktop spreadsheet applications when an exported file is opened.
+ * Exported values include patient-controlled free text (names, remarks,
+ * notes), so prefix a dangerous leading character with a single quote —
+ * the standard guard that renders the cell as literal text.
+ */
+const SPREADSHEET_FORMULA_PREFIX = /^[=+\-@]/;
+
+export function sanitizeSpreadsheetCell(value: string | number | null | undefined): string {
+  const s = value === null || value === undefined ? "" : String(value);
+  return SPREADSHEET_FORMULA_PREFIX.test(s) ? `'${s}` : s;
+}

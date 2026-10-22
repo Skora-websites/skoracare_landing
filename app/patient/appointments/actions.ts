@@ -1,0 +1,282 @@
+"use server";
+
+import { revalidatePath } from "next/cache";
+import { redirect } from "next/navigation";
+import { and, eq, inArray, ne } from "drizzle-orm";
+import { db } from "@/lib/db";
+import { appointments, doctorClinics, doctorSchedules, users } from "@/lib/db/schema";
+import { getCurrentUser } from "@/lib/auth/user";
+import { findDuplicateBooking, duplicateBookingError } from "@/lib/db/duplicate-booking";
+import { sendMail } from "@/lib/mail/send";
+import { notifyUser, wantsNotification } from "@/lib/notifications";
+import { audit } from "@/lib/security/audit-log";
+import { todayStr } from "@/lib/utils";
+
+export type PatientBookingState = { error: string | null };
+
+function parseTimeToMinutes(t: string): number | null {
+  const m = t.trim().match(/^(\d{1,2}):(\d{2})\s*(AM|PM)?$/i);
+  if (!m) return null;
+  let h = Number(m[1]);
+  const min = Number(m[2]);
+  const meridiem = m[3]?.toUpperCase();
+  if (meridiem) {
+    if (h < 1 || h > 12) return null;
+    if (meridiem === "PM" && h !== 12) h += 12;
+    if (meridiem === "AM" && h === 12) h = 0;
+  } else {
+    if (h > 23) return null;
+  }
+  if (min > 59) return null;
+  return h * 60 + min;
+}
+
+function toLegacyTime(time: string): string {
+  const m = time.match(/^(\d{1,2}):(\d{2})$/);
+  if (!m) return time;
+  let h = Number(m[1]);
+  const min = m[2];
+  const meridiem = h >= 12 ? "PM" : "AM";
+  if (h === 0) h = 12;
+  else if (h > 12) h -= 12;
+  return `${h}:${min} ${meridiem}`;
+}
+
+function weekdayName(dateStr: string): string {
+  return new Date(`${dateStr}T00:00:00`)
+    .toLocaleDateString("en-US", { weekday: "long" })
+    .toLowerCase();
+}
+
+function timeInSchedule(timeMin: number, schedule: typeof doctorSchedules.$inferSelect): boolean {
+  if (schedule.is24Hours) return true;
+  const start = parseTimeToMinutes(schedule.startTime ?? "");
+  const end = parseTimeToMinutes(schedule.endTime ?? "");
+  if (start === null || end === null) return false;
+  let endAdj = end;
+  if (end < start) endAdj = end + 24 * 60;
+  let t = timeMin;
+  if (end < start && t < start) t += 24 * 60;
+  return t >= start && t <= endAdj;
+}
+
+export async function createPatientAppointment(
+  _prev: PatientBookingState,
+  formData: FormData
+): Promise<PatientBookingState> {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  if (user.role !== "patient") return { error: "Only patients can book appointments." };
+
+  const doctorId = Number(formData.get("doctor_id"));
+  const date = String(formData.get("date") ?? "").trim();
+  const timeRaw = String(formData.get("time") ?? "").trim();
+  const caseType = String(formData.get("case_type") ?? "clinical_visit").trim();
+
+  if (!doctorId || !Number.isInteger(doctorId) || doctorId <= 0) {
+    return { error: "Please choose a doctor." };
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return { error: "Invalid date." };
+  if (!/^\d{2}:\d{2}$/.test(timeRaw)) return { error: "Invalid time." };
+  if (!["clinical_visit", "home_visit"].includes(caseType)) return { error: "Invalid visit type." };
+
+  const now = new Date();
+  const today = todayStr(now);
+  if (date < today) return { error: "Date cannot be in the past." };
+  const tMin = parseTimeToMinutes(timeRaw);
+  if (tMin === null) return { error: "Invalid time." };
+  if (date === today && tMin < now.getHours() * 60 + now.getMinutes()) {
+    return { error: "Appointment time must be in the future." };
+  }
+
+  // Doctor must exist and be a doctor role.
+  const [doctor] = await db
+    .select({ id: users.id })
+    .from(users)
+    .where(and(eq(users.role, "doctor"), eq(users.id, doctorId)))
+    .limit(1);
+  if (!doctor) return { error: "Doctor not found." };
+
+  // Verify the doctor has an active clinic + schedule for this weekday.
+  const clinics = await db
+    .select({ id: doctorClinics.id })
+    .from(doctorClinics)
+    .where(and(eq(doctorClinics.doctorId, doctorId), eq(doctorClinics.isActive, true)));
+  if (clinics.length === 0) return { error: "This doctor has no active clinic." };
+
+  const schedules = await db
+    .select()
+    .from(doctorSchedules)
+    .where(
+      and(
+        eq(doctorSchedules.dayOfWeek, weekdayName(date) as never),
+        eq(doctorSchedules.isActive, true),
+        inArray(
+          doctorSchedules.doctorClinicId,
+          clinics.map((c) => c.id)
+        )
+      )
+    );
+  if (schedules.length === 0) {
+    return { error: "The doctor is not available on this day. Please choose another date." };
+  }
+  const matching = schedules.find((s) => timeInSchedule(tMin, s));
+  if (!matching) {
+    return { error: "The selected time is outside the doctor's available schedule." };
+  }
+
+  const time = toLegacyTime(timeRaw);
+
+  // ── Duplicates finder: same patient already booked at this date + time ──
+  const duplicate = await findDuplicateBooking({ patientId: user.id, date, time });
+  if (duplicate) return { error: duplicateBookingError(duplicate) };
+
+  // Insert under a doctor-row lock (SELECT ... FOR UPDATE) serializing
+  // concurrent bookings for the same doctor — closes the check-then-insert
+  // double-booking race (mirrors the doctor-side create).
+  try {
+    await db.transaction(async (tx) => {
+      await tx.select({ id: users.id }).from(users).where(eq(users.id, doctorId)).for("update");
+      const [conflict] = await tx
+        .select({ id: appointments.id })
+        .from(appointments)
+        .where(
+          and(
+            eq(appointments.doctorId, doctorId),
+            eq(appointments.date, date as never),
+            eq(appointments.time, time),
+            ne(appointments.status, "cancelled")
+          )
+        )
+        .limit(1);
+      if (conflict) throw new Error(`Time slot ${time} is already booked.`);
+      const [dup] = await tx
+        .select({ id: appointments.id })
+        .from(appointments)
+        .where(
+          and(
+            eq(appointments.patientId, user.id),
+            eq(appointments.date, date as never),
+            eq(appointments.time, time),
+            ne(appointments.status, "cancelled")
+          )
+        )
+        .limit(1);
+      if (dup) throw new Error("Duplicate booking: you already have an appointment on this date at this time.");
+
+      await tx.insert(appointments).values({
+        doctorId,
+        patientId: user.id,
+        date: date as never,
+        time,
+        caseType: caseType as never,
+        status: "confirmed" as never,
+        consentType: "skipped",
+        createdAt: now,
+        updatedAt: now,
+      });
+    });
+  } catch (err) {
+    if (err instanceof Error && (err.message.includes("already booked") || err.message.startsWith("Duplicate booking"))) {
+      return { error: err.message };
+    }
+    throw err;
+  }
+
+  void audit.appointmentCreated(user.id, {
+    source: "patient_self_service",
+    doctorId,
+    date,
+    time,
+    patientId: user.id,
+  });
+
+  // Notify the patient (confirmation email) + the doctor (in-app + email), fire-and-forget.
+  void (async () => {
+    try {
+      const [doctor] = await db
+        .select({ name: users.name, email: users.email })
+        .from(users)
+        .where(eq(users.id, doctorId));
+
+      if (user.email && (await wantsNotification(user.id, "email", "appointment_booking"))) {
+        await sendMail({
+          to: user.email,
+          subject: "Appointment confirmed — SkoraCares",
+          text: `Hi ${user.name},\n\nYour appointment has been confirmed:\nDoctor: ${doctor?.name ?? "Your doctor"}\nDate: ${date}\nTime: ${time}\nType: ${caseType.replace(/_/g, " ")}\n\nSee you soon!\n— SkoraCares`,
+        });
+      }
+
+      if (
+        doctor?.email &&
+        (await wantsNotification(doctorId, "email", "appointment_booking"))
+      ) {
+        await sendMail({
+          to: doctor.email,
+          subject: "New appointment booked — SkoraCares",
+          text: `Hi ${doctor.name},\n\n${user.name} has booked a ${caseType.replace(/_/g, " ")} on ${date} at ${time}.\n\n— SkoraCares`,
+        });
+      }
+
+      await notifyUser({
+        userId: doctorId,
+        title: "New appointment booked",
+        message: `${user.name} — ${date} at ${time} (${caseType.replace(/_/g, " ")})`,
+        type: "success",
+        link: "/doctor/appointments",
+      });
+    } catch {
+      // Email/notification failure must never block the booking response.
+    }
+  })();
+
+  revalidatePath("/patient");
+  revalidatePath("/patient/appointments");
+  redirect("/patient/appointments?created=1");
+}
+
+/** Patient cancels one of their own upcoming appointments. */
+export async function cancelPatientAppointment(appointmentId: number): Promise<PatientBookingState> {
+  const user = await getCurrentUser();
+  if (!user) redirect("/login");
+  if (user.role !== "patient") return { error: "Only patients can cancel appointments." };
+  if (!appointmentId || !Number.isInteger(appointmentId)) return { error: "Invalid appointment ID." };
+
+  const [appt] = await db
+    .select({ id: appointments.id, status: appointments.status, date: appointments.date, time: appointments.time, doctorId: appointments.doctorId })
+    .from(appointments)
+    .where(and(eq(appointments.id, appointmentId), eq(appointments.patientId, user.id)));
+  if (!appt) return { error: "Appointment not found." };
+  if (appt.status === "cancelled") return { error: "Appointment is already cancelled." };
+  if (appt.status === "completed") return { error: "Completed appointments cannot be cancelled." };
+
+  // Business rule: past / already-started appointments cannot be cancelled
+  // (mirrors the doctor-side cancel guard).
+  const now = new Date();
+  const today = todayStr(now);
+  const tMin = parseTimeToMinutes(appt.time);
+  const nowMinutes = now.getHours() * 60 + now.getMinutes();
+  if (appt.date < today || (appt.date === today && tMin !== null && tMin <= nowMinutes)) {
+    return { error: "Past appointments cannot be cancelled." };
+  }
+
+  await db
+    .update(appointments)
+    .set({ status: "cancelled", updatedAt: new Date() })
+    .where(eq(appointments.id, appointmentId));
+
+  void audit.appointmentCancelled(user.id, { appointmentId, doctorId: appt.doctorId, source: "patient_cancelled" });
+
+  // Notify the doctor their patient cancelled (in-app), fire-and-forget.
+  void notifyUser({
+    userId: appt.doctorId,
+    title: "Appointment cancelled by patient",
+    message: `${user.name} cancelled the ${appt.date} appointment.`,
+    type: "warning",
+    link: "/doctor/appointments",
+  });
+
+  revalidatePath("/patient");
+  revalidatePath("/patient/appointments");
+  return { error: null };
+}
