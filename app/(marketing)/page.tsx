@@ -6,9 +6,9 @@ import {
   ShieldCheck,
 } from "lucide-react";
 import { getLandingData } from "@/lib/queries/landing";
-import { getCurrentUser } from "@/lib/auth/user";
-import { isRazorpayConfigured } from "@/lib/packages/razorpay";
-import { PACKAGE_PLANS } from "@/lib/packages/config";
+
+
+
 import { LandingHero } from "@/components/marketing/landing-hero";
 import { FeaturesBento } from "@/components/marketing/features-bento";
 import { HowItWorks } from "@/components/marketing/how-it-works";
@@ -39,17 +39,7 @@ const STATS = [
 
 export default async function HomePage() {
   const data = await getLandingData();
-  const user = await getCurrentUser();
-  const checkoutPlans =
-    user?.role === "doctor" && isRazorpayConfigured()
-      ? PACKAGE_PLANS.map((p) => ({
-          title: p.name,
-          packageId: p.id,
-          buyerName: user.name,
-          buyerEmail: user.email,
-          buyerPhone: user.phone,
-        }))
-      : undefined;
+  const checkoutPlans = undefined;
 
   const hero = data.get("hero");
   const features = data.get("features");
@@ -138,7 +128,7 @@ export default async function HomePage() {
               id: s.id,
               title: s.title,
               description: s.description,
-              badge: s.badge,
+              badge: s.badge ?? null,
             })) ?? []}
           />
           {/* Mobile transition: Slide 3 (#03120E) -> Slide 4 Suite of Solutions (#143B30) */}

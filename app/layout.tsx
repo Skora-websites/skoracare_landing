@@ -1,9 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import localFont from "next/font/local";
 import "./globals.css";
-import { PwaSetup } from "@/components/pwa/pwa-setup";
-import { SplashScreen } from "@/components/pwa/splash-screen";
-import { AgentationDev } from "@/components/dev/agentation-dev";
 
 const alteHaasGrotesk = localFont({
   src: [
@@ -60,54 +57,29 @@ export const metadata: Metadata = {
   ],
   openGraph: {
     title: "SkoraCares — Smarter Patient & Clinic Management",
-    description:
-      "Purpose-built tools for modern healthcare professionals.",
+    description: "Purpose-built tools for modern healthcare professionals.",
     type: "website",
-  },
-  // PWA
-  manifest: "/manifest.webmanifest",
-  appleWebApp: {
-    capable: true,
-    title: "SkoraCare",
-    statusBarStyle: "default",
-  },
-  icons: {
-    icon: [{ url: "/icons/icon-192.png" }, { url: "/icons/icon-512.png" }],
-    apple: [{ url: "/icons/icon-192.png" }],
-  },
-  other: {
-    "theme-color": "#114232",
   },
 };
 
 export const viewport: Viewport = {
-  // Native-app feel: no pinch-zoom or pan, covers the whole screen on
-  // notched devices, and fits the iOS safe area.
   width: "device-width",
   initialScale: 1,
-  maximumScale: 1,
-  userScalable: false,
   viewportFit: "cover",
 };
 
-// Nonce-based CSP (audit F-08): the proxy generates a per-request nonce and
-// Next.js applies it during SSR only for DYNAMICALLY rendered pages. Static
-// generation happens at build time with no request, so its bootstrap scripts
-// would carry no nonce and be blocked by the nonce-locked script-src. This
-// must stay in lockstep with proxy.ts's buildCsp().
-export const dynamic = "force-dynamic";
-
-export default function RootLayout({ children }: LayoutProps<"/">) {
+export default function RootLayout({
+  children,
+}: {
+  children: React.ReactNode;
+}) {
   return (
     <html
       lang="en"
       className={`${alteHaasGrotesk.variable} ${redaction.variable} h-full antialiased`}
     >
       <body className="min-h-full">
-        <SplashScreen />
         {children}
-        <PwaSetup />
-        <AgentationDev />
       </body>
     </html>
   );

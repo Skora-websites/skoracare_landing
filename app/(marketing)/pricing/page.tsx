@@ -18,9 +18,9 @@ import { Pricing } from "@/components/marketing/pricing";
 import { Faq } from "@/components/marketing/faq";
 import { ArrowCta } from "@/components/ui/arrow-cta";
 import { getLandingData } from "@/lib/queries/landing";
-import { getCurrentUser } from "@/lib/auth/user";
-import { isRazorpayConfigured } from "@/lib/packages/razorpay";
-import { PACKAGE_PLANS } from "@/lib/packages/config";
+
+
+
 
 export const metadata: Metadata = {
   title: "Pricing Plans for Modern Clinics | SkoraCares",
@@ -37,17 +37,7 @@ export default async function PricingPage() {
 
   // Doctors see live checkout buttons on the pricing cards (Razorpay);
   // every other visitor keeps marketing demo links.
-  const user = await getCurrentUser();
-  const checkoutPlans =
-    user?.role === "doctor" && isRazorpayConfigured()
-      ? PACKAGE_PLANS.map((p) => ({
-          title: p.name,
-          packageId: p.id,
-          buyerName: user.name,
-          buyerEmail: user.email,
-          buyerPhone: user.phone,
-        }))
-      : undefined;
+  const checkoutPlans = undefined;
 
   // 3 Clinical Practice Categories / Personas
   const practiceCategories = [

@@ -1,7 +1,4 @@
 import { cache } from "react";
-import { and, desc, eq, isNull, or, sql } from "drizzle-orm";
-import { db } from "@/lib/db";
-import { blogs, categories } from "@/lib/db/schema";
 
 export type PublishedBlogPost = {
   id: number;
@@ -61,90 +58,32 @@ const DEFAULT_BLOGS: PublishedBlogPost[] = [
   },
   {
     id: 3,
-    title: "Digitizing Your Clinic's Financial Ledger & GST Invoicing",
-    slug: "clinic-financial-ledger-gst-invoicing",
+    title: "Multi-Clinic Practice Management: Managing 5 Locations from One Screen",
+    slug: "multi-clinic-practice-management-architecture",
     shortcontent:
-      "Simplify daily cash reconciliation, doctor payout splits, and GST compliance with an automated healthcare accounting workflow.",
+      "Cross-location staff rosters, centralized inventory reordering, and unified patient EMRs — how doctor chains scale without losing control.",
     content: `
-      <h2>Accounting Complexities in Healthcare</h2>
-      <p>Unlike standard retail, clinics deal with multiple consultation fee tiers, doctor fee split-percentages, pharmacy dispensing margins, and external lab vendor commissions. Tracking these in separate spreadsheets leads to revenue leakages.</p>
+      <h2>The Multi-Clinic Coordination Challenge</h2>
+      <p>Opening a second or third clinic branch is a milestone, but operating multiple locations with disjointed software causes stock discrepancies, lost follow-ups, and fragmented patient histories.</p>
       
-      <h2>Automated Day-End Cash Balancing</h2>
-      <p>With SkoraCares integrated ledger, every consultation, lab test collection, and medicine sale is logged in real-time. Front-desk staff can balance the cash register with UPI receipts in under 2 minutes at the end of every shift.</p>
+      <h2>Unified Telemetry & Cross-Branch Visibility</h2>
+      <p>With SkoraCares Multi-Branch Architecture, medical directors switch between clinical locations with a single click. Inventory transfers between clinic dispensaries are reconciled in real-time, eliminating expired medicine write-offs.</p>
     `,
     image: null,
-    createdAt: new Date("2026-10-10"),
-    category: "Finance & Operations",
+    createdAt: new Date("2026-10-05"),
+    category: "Practice Growth",
   },
 ];
 
 export const getPublishedBlogs = cache(async (): Promise<PublishedBlogPost[]> => {
-  try {
-    const rows = await db
-      .select({
-        id: blogs.id,
-        title: blogs.title,
-        slug: blogs.slug,
-        shortcontent: blogs.shortcontent,
-        image: blogs.image,
-        createdAt: blogs.createdAt,
-        category: categories.name,
-      })
-      .from(blogs)
-      .innerJoin(categories, eq(categories.id, blogs.categoryId))
-      .where(
-        and(
-          eq(blogs.status, true),
-          // Published now OR scheduled to publish in the past.
-          or(isNull(blogs.publishAt), sql`${blogs.publishAt} <= NOW()`)
-        )
-      )
-      .orderBy(desc(blogs.createdAt));
-
-    if (rows && rows.length > 0) return rows;
-    return DEFAULT_BLOGS;
-  } catch (error) {
-    console.warn(
-      "[getPublishedBlogs] Database offline or unreachable, using default static fallback posts."
-    );
-    return DEFAULT_BLOGS;
-  }
+  return DEFAULT_BLOGS;
 });
 
-export const getBlogBySlug = cache(
+export const getPublishedBlogBySlug = cache(
   async (slug: string): Promise<PublishedBlogPost | null> => {
-    try {
-      const [row] = await db
-        .select({
-          id: blogs.id,
-          title: blogs.title,
-          slug: blogs.slug,
-          shortcontent: blogs.shortcontent,
-          content: blogs.content,
-          image: blogs.image,
-          createdAt: blogs.createdAt,
-          category: categories.name,
-        })
-        .from(blogs)
-        .innerJoin(categories, eq(categories.id, blogs.categoryId))
-        .where(
-          and(
-            eq(blogs.slug, slug),
-            eq(blogs.status, true),
-            or(isNull(blogs.publishAt), sql`${blogs.publishAt} <= NOW()`)
-          )
-        );
-
-      if (row) return row;
-      const fallback = DEFAULT_BLOGS.find((b) => b.slug === slug);
-      return fallback ?? null;
-    } catch (error) {
-      console.warn(
-        `[getBlogBySlug] Database offline or unreachable for slug ${slug}, checking fallback posts.`
-      );
-      const fallback = DEFAULT_BLOGS.find((b) => b.slug === slug);
-      return fallback ?? null;
-    }
+    return DEFAULT_BLOGS.find((b) => b.slug === slug) ?? null;
   }
 );
 
+export const getBlogBySlug = getPublishedBlogBySlug;
+export const getBlogs = getPublishedBlogs;

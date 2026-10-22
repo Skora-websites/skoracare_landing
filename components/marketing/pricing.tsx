@@ -6,7 +6,7 @@ import { Check, X, ChevronRight } from "lucide-react";
 import { motion, AnimatePresence } from "motion/react";
 import { cn } from "@/lib/utils";
 import type { LandingItem } from "@/lib/db/schema";
-import { PackageCheckoutButton } from "@/components/packages/package-checkout-button";
+
 import { BlurryToClear } from "@/components/ui/blurry-to-clear";
 
 type PlanFeature = {
@@ -376,26 +376,7 @@ export function Pricing({
 
                 {/* Main Action Button */}
                 <div className="mt-5 sm:mt-6">
-                  {checkout ? (
-                    <PackageCheckoutButton
-                      packageId={checkout.packageId}
-                      packageName={originalTitle}
-                      period={yearly ? "yearly" : "monthly"}
-                      label={plan.linkText ?? "Get started"}
-                      variant={isPopular ? "primary" : "secondary"}
-                      className={cn(
-                        "w-full py-3 sm:py-3.5 px-6 rounded-2xl font-main text-sm font-semibold transition-all hover:scale-[1.01] active:scale-[0.99] text-center",
-                        isPopular
-                          ? "bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400 text-white shadow-[0_6px_22px_rgba(16,185,129,0.35)]"
-                          : "bg-gradient-to-b from-[#2a2a2a] to-[#121212] hover:from-[#363636] hover:to-[#1c1c1c] text-white shadow-[0_4px_14px_rgba(0,0,0,0.18)] border border-white/10"
-                      )}
-                      buyer={{
-                        name: checkout.buyerName,
-                        email: checkout.buyerEmail,
-                        phone: checkout.buyerPhone,
-                      }}
-                    />
-                  ) : (
+                  (
                     <a
                       href={
                         plan.link && !plan.link.startsWith("#")
@@ -411,7 +392,6 @@ export function Pricing({
                     >
                       {plan.linkText ?? "Get started"}
                     </a>
-                  )}
                 </div>
               </div>
 
@@ -630,26 +610,7 @@ export function Pricing({
                   {/* Modal Footer / Action Button (Pinned / Non-shrinking / Always Visible) */}
                   <div className="p-4 sm:p-5 border-t border-slate-100 bg-white flex items-center gap-3 shrink-0 pb-6 sm:pb-5 shadow-[0_-4px_16px_rgba(0,0,0,0.04)]">
                     <div className="flex-1">
-                      {selectedPlan.checkout ? (
-                        <PackageCheckoutButton
-                          packageId={selectedPlan.checkout.packageId}
-                          packageName={selectedPlan.plan.title ?? selectedPlan.meta.title}
-                          period={yearly ? "yearly" : "monthly"}
-                          label={selectedPlan.plan.linkText ?? "Get started"}
-                          variant={selectedPlan.isPopular ? "primary" : "secondary"}
-                          className={cn(
-                            "w-full py-3 px-5 rounded-xl font-main text-sm font-semibold transition-all text-center",
-                            selectedPlan.isPopular
-                              ? "bg-gradient-to-r from-emerald-600 to-emerald-500 hover:from-emerald-500 hover:to-emerald-400 text-white shadow-[0_4px_16px_rgba(16,185,129,0.3)]"
-                              : "bg-slate-900 hover:bg-slate-800 text-white shadow-sm"
-                          )}
-                          buyer={{
-                            name: selectedPlan.checkout.buyerName,
-                            email: selectedPlan.checkout.buyerEmail,
-                            phone: selectedPlan.checkout.buyerPhone,
-                          }}
-                        />
-                      ) : (
+                      (
                         <a
                           href={
                             selectedPlan.plan.link && !selectedPlan.plan.link.startsWith("#")
@@ -665,7 +626,6 @@ export function Pricing({
                         >
                           {selectedPlan.plan.linkText ?? "Get started"}
                         </a>
-                      )}
                     </div>
                     <button
                       type="button"
