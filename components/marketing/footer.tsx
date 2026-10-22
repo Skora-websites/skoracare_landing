@@ -66,6 +66,7 @@ const SKORA_COLUMNS = [
   {
     title: "Contact",
     links: [
+      { label: "Greater Noida West, India", href: "/contact" },
       { label: "+91 921 7375 831", href: "tel:+919217375831" },
       { label: "info@skoracares.com", href: "mailto:info@skoracares.com" },
       {
