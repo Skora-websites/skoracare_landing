@@ -150,7 +150,7 @@ export function Header() {
           {/* CTA Actions */}
           <div className="hidden items-center gap-4 md:flex">
             <Link
-              href="/login"
+              href={process.env.NEXT_PUBLIC_APP_URL ? `${process.env.NEXT_PUBLIC_APP_URL}/login` : "/contact"}
               className={cn(
                 "text-sm font-medium transition-colors px-2 py-1",
                 scrolled
@@ -160,7 +160,7 @@ export function Header() {
             >
               Sign In
             </Link>
-            <HudButton href="/signup" size="sm">
+            <HudButton href="/contact" size="sm">
               Get Started
             </HudButton>
           </div>
