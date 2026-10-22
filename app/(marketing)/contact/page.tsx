@@ -47,7 +47,7 @@ export default async function ContactPage() {
     {
       icon: MapPin,
       label: "Technology Headquarters",
-      value: "SkoraSoft Technologies",
+      value: "SkoraInfotech",
       subtext: "New Delhi, India • Serving pan-India healthcare facilities",
     },
     {

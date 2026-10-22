@@ -80,7 +80,7 @@ const SKORA_COLUMNS = [
       },
       {
         label: "LinkedIn",
-        href: "https://www.linkedin.com/company/skorasoft",
+        href: "https://www.linkedin.com/company/skorainfotech",
         icon: <LinkedInIcon className="h-4 w-4" />,
       },
       {

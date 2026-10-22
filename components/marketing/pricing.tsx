@@ -376,7 +376,6 @@ export function Pricing({
 
                 {/* Main Action Button */}
                 <div className="mt-5 sm:mt-6">
-                  (
                     <a
                       href={
                         plan.link && !plan.link.startsWith("#")
@@ -610,7 +609,6 @@ export function Pricing({
                   {/* Modal Footer / Action Button (Pinned / Non-shrinking / Always Visible) */}
                   <div className="p-4 sm:p-5 border-t border-slate-100 bg-white flex items-center gap-3 shrink-0 pb-6 sm:pb-5 shadow-[0_-4px_16px_rgba(0,0,0,0.04)]">
                     <div className="flex-1">
-                      (
                         <a
                           href={
                             selectedPlan.plan.link && !selectedPlan.plan.link.startsWith("#")
